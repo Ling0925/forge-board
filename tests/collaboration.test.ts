@@ -1,0 +1,254 @@
+import { describe, expect, it } from "vitest";
+import { expectCode, fixture } from "./helpers.js";
+
+describe("comments, artifacts, links, and labels", () => {
+  it("allows questions on todo, blocked, and in-review tasks", () => {
+    const { board, admin, task } = fixture();
+    for (const status of ["todo", "blocked", "in_review"] as const) {
+      let item = task(status);
+      if (status !== "todo") {
+        item = board.transition(
+          admin,
+          item.id,
+          { to: "in_progress" },
+          { expectedVersion: item.version },
+        ).task;
+        item = board.transition(
+          admin,
+          item.id,
+          { to: status },
+          { expectedVersion: item.version },
+        ).task;
+      }
+      expect(
+        board.addComment(
+          admin,
+          item.id,
+          { kind: "question", body: "Need input" },
+          { expectedVersion: item.version },
+        ).task.status,
+      ).toBe("input_required");
+    }
+  });
+  it("moves questions to input_required and answer replies back to in_progress", () => {
+    const { board, owner, agent, task } = fixture();
+    let item = board.claim(agent, task().id).task;
+    const question = board.addComment(
+      agent,
+      item.id,
+      { kind: "question", body: "Which format?" },
+      { expectedVersion: item.version, leaseToken: item.lease!.token },
+    );
+    expect(question.task.status).toBe("input_required");
+    item = board.addComment(
+      owner,
+      item.id,
+      { kind: "answer", replyTo: question.comment.id, body: "JSON" },
+      { expectedVersion: question.task.version },
+    ).task;
+    expect(item.status).toBe("in_progress");
+    const decision = board.addComment(
+      owner,
+      item.id,
+      { kind: "decision", body: "Use JSON" },
+      { expectedVersion: item.version },
+    );
+    expect(decision.task.status).toBe("in_progress");
+    expect(
+      board
+        .listComments(owner, item.id, { limit: 100 })
+        .items.map((comment) => comment.kind)
+        .sort(),
+    ).toEqual(["answer", "decision", "question"]);
+    expectCode(
+      () =>
+        board.addComment(
+          owner,
+          item.id,
+          { kind: "answer", body: "No question" },
+          { expectedVersion: decision.task.version },
+        ),
+      "conflict",
+    );
+  });
+
+  it("enforces comment reply task boundaries and gates automatic question/answer transitions", () => {
+    const { board, admin, agent, owner, task } = fixture({
+      approvalRequired: [
+        "in_progress->input_required",
+        "input_required->in_progress",
+      ],
+    });
+    const item = board.claim(agent, task().id).task;
+    const question = board.addComment(
+      agent,
+      item.id,
+      { kind: "question", body: "Review?" },
+      { expectedVersion: item.version, leaseToken: item.lease!.token },
+    );
+    expect(question.task.status).toBe("in_progress");
+    const approved = board.decideApproval(
+      owner,
+      question.approval!.id,
+      "approved",
+      { expectedVersion: question.task.version },
+    );
+    expect(approved.task.status).toBe("input_required");
+    const answer = board.addComment(
+      owner,
+      item.id,
+      { kind: "answer", body: "Yes", replyTo: question.comment.id },
+      { expectedVersion: approved.task.version },
+    );
+    expect(answer.task.status).toBe("input_required");
+    expect(
+      board.decideApproval(admin, answer.approval!.id, "approved", {
+        expectedVersion: answer.task.version,
+      }).task.status,
+    ).toBe("in_progress");
+    const unrelated = task("Unrelated");
+    expectCode(
+      () =>
+        board.addComment(
+          owner,
+          unrelated.id,
+          { kind: "answer", body: "Cross task", replyTo: question.comment.id },
+          { expectedVersion: unrelated.version },
+        ),
+      "conflict",
+    );
+  });
+
+  it("increments artifact versions per task and name and supports URI or inline text", () => {
+    const { board, admin, task } = fixture();
+    let item = task();
+    const first = board.addArtifact(
+      admin,
+      item.id,
+      {
+        name: "report",
+        mediaType: "text/plain",
+        content: { uri: null, text: "First" },
+      },
+      { expectedVersion: item.version },
+    );
+    const second = board.addArtifact(
+      admin,
+      item.id,
+      {
+        name: "report",
+        mediaType: "text/plain",
+        content: { uri: "file:///report", text: null },
+      },
+      { expectedVersion: first.task.version },
+    );
+    const other = board.addArtifact(
+      admin,
+      item.id,
+      {
+        name: "log",
+        mediaType: "text/plain",
+        content: { uri: null, text: "Log" },
+      },
+      { expectedVersion: second.task.version },
+    );
+    expect([
+      first.artifact.version,
+      second.artifact.version,
+      other.artifact.version,
+    ]).toEqual([1, 2, 1]);
+    item = task("Other task");
+    expect(
+      board.addArtifact(
+        admin,
+        item.id,
+        {
+          name: "report",
+          mediaType: "text/plain",
+          content: { uri: null, text: "Other" },
+        },
+        { expectedVersion: item.version },
+      ).artifact.version,
+    ).toBe(1);
+    expect(
+      board.listArtifacts(admin, first.task.id, { limit: 100 }).items,
+    ).toHaveLength(3);
+  });
+
+  it("supports each link kind, reference queries, and deletion", () => {
+    const { board, admin, task } = fixture();
+    let item = task();
+    for (const kind of [
+      "thread",
+      "session",
+      "pr",
+      "issue",
+      "url",
+      "task",
+    ] as const)
+      item = board.addLink(
+        admin,
+        item.id,
+        { kind, ref: `${kind}:reference` },
+        { expectedVersion: item.version },
+      ).task;
+    expect(
+      board
+        .listTasks(admin, { limit: 100, link: "thread:reference" })
+        .items.map((task) => task.id),
+    ).toEqual([item.id]);
+    const links = board.listLinks(admin, item.id, { limit: 100 }).items;
+    expect(links).toHaveLength(6);
+    const link = links.find((link) => link.kind === "thread")!;
+    item = board.removeLink(admin, item.id, link.id, {
+      expectedVersion: item.version,
+    });
+    expect(
+      board.listTasks(admin, { limit: 100, link: "thread:reference" }).items,
+    ).toEqual([]);
+    expectCode(
+      () =>
+        board.removeLink(admin, item.id, link.id, {
+          expectedVersion: item.version,
+        }),
+      "not_found",
+    );
+  });
+
+  it("keeps labels within their project and supports assignment, filtering, and removal", () => {
+    const { board, admin, project, task } = fixture();
+    let item = task();
+    const label = board.createLabel(admin, project.id, "bug");
+    expect(board.listLabels(admin, project.id, { limit: 100 }).items).toEqual([
+      label,
+    ]);
+    item = board.addLabel(admin, item.id, label.id, {
+      expectedVersion: item.version,
+    });
+    expect(
+      board
+        .listTasks(admin, { limit: 100, label: label.id })
+        .items.map((task) => task.id),
+    ).toEqual([item.id]);
+    expect(board.getTask(admin, item.id).labels).toEqual([label.id]);
+    const otherProject = board.createProject(admin, {
+      key: "OTHER",
+      name: "Other",
+    });
+    const otherLabel = board.createLabel(admin, otherProject.id, "other");
+    expectCode(
+      () =>
+        board.addLabel(admin, item.id, otherLabel.id, {
+          expectedVersion: item.version,
+        }),
+      "conflict",
+    );
+    item = board.removeLabel(admin, item.id, label.id, {
+      expectedVersion: item.version,
+    });
+    expect(item.labels).toEqual([]);
+    expect(
+      board.listTasks(admin, { limit: 100, label: label.id }).items,
+    ).toEqual([]);
+  });
+});

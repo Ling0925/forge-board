@@ -1,0 +1,51 @@
+{
+  "name": "forge-board",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Shared task coordination for humans and agents",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./domain": {
+      "types": "./src/domain/index.ts",
+      "import": "./dist/domain/index.js"
+    },
+    "./store": {
+      "types": "./src/store/index.ts",
+      "import": "./dist/store/index.js"
+    },
+    "./service": {
+      "types": "./src/service/index.ts",
+      "import": "./dist/service/index.js"
+    },
+    "./http": {
+      "types": "./src/http/index.ts",
+      "import": "./dist/http/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": { "forge-board": "dist/cli.js" },
+  "files": ["dist", "src", "LICENSE"],
+  "engines": { "node": ">=22.23.1 <23" },
+  "packageManager": "pnpm@11.18.0",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check ."
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "hono": "^4.13.14",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@apidevtools/swagger-parser": "^13.1.0",
+    "@biomejs/biome": "^1.9.4",
+    "@types/node": "^22.14.0",
+    "esbuild": "^0.25.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.2"
+  }
+}
