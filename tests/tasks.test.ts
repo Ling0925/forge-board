@@ -2,6 +2,210 @@ import { describe, expect, it } from "vitest";
 import { expectCode, fixture } from "./helpers.js";
 
 describe("task rules and graph", () => {
+  it.each([undefined, "", "Finished"])(
+    "completes directly with atomic progress %s",
+    (progress) => {
+      const { board, admin, agent, repo, task } = fixture();
+      let item = board.claim(agent, task().id).task;
+      item = board.updateTask(
+        agent,
+        item.id,
+        { progress: "Working" },
+        {
+          leaseToken: item.lease!.token,
+        },
+      );
+      const before = repo.events(0).at(-1)!.seq;
+      const result = board.transition(
+        agent,
+        item.id,
+        {
+          to: "done",
+          message: "Shipped",
+          ...(progress === undefined ? {} : { progress }),
+        },
+        { leaseToken: item.lease!.token },
+      );
+      expect(result).toEqual({
+        task: {
+          ...item,
+          status: "done",
+          statusMessage: "Shipped",
+          progress: progress ?? item.progress,
+          lease: null,
+          version: item.version + 1,
+        },
+        approval: null,
+      });
+      expect(board.getTask(admin, item.id)).toEqual(result.task);
+      expect(repo.events(before).map((event) => event.type)).toEqual([
+        "task_transitioned",
+      ]);
+    },
+  );
+
+  it("does not save progress on a rejected transition", () => {
+    const { board, admin, repo, task } = fixture();
+    const item = task();
+    const events = repo.events(0);
+    expectCode(
+      () =>
+        board.transition(
+          admin,
+          item.id,
+          { to: "done", progress: "No" },
+          { expectedVersion: item.version },
+        ),
+      "invalid_transition",
+    );
+    expect(board.getTask(admin, item.id)).toEqual(item);
+    expect(repo.events(0)).toEqual(events);
+  });
+
+  it.each([undefined, false, true])(
+    "applies allowAgentCancel=%s with normal write checks",
+    (allowAgentCancel) => {
+      const { board, admin, agent, task, repo } = fixture(
+        allowAgentCancel === undefined ? {} : { allowAgentCancel },
+      );
+      const item = board.claim(agent, task().id).task;
+      const input = { to: "canceled" as const, progress: "Stopped" };
+      expectCode(() => board.transition(agent, item.id, input), "lease_lost");
+      expectCode(
+        () => board.transition(agent, item.id, input, { leaseToken: "wrong" }),
+        "lease_lost",
+      );
+      expectCode(
+        () =>
+          board.transition(agent, item.id, input, {
+            leaseToken: item.lease!.token,
+            expectedVersion: item.version - 1,
+          }),
+        "version_mismatch",
+      );
+      expectCode(
+        () =>
+          board.transition(
+            { ...agent, scopes: ["tasks:read"] },
+            item.id,
+            input,
+            { leaseToken: item.lease!.token },
+          ),
+        "forbidden",
+      );
+      expectCode(
+        () =>
+          board.transition({ ...agent, projectIds: [] }, item.id, input, {
+            leaseToken: item.lease!.token,
+          }),
+        "forbidden",
+      );
+      const before = repo.events(0);
+      if (allowAgentCancel) {
+        const canceled = board.transition(agent, item.id, input, {
+          leaseToken: item.lease!.token,
+        });
+        expect(canceled.task).toMatchObject({
+          status: "canceled",
+          progress: "Stopped",
+          lease: null,
+          version: item.version + 1,
+        });
+        expect(repo.events(before.at(-1)!.seq)).toHaveLength(1);
+      } else {
+        expectCode(
+          () =>
+            board.transition(agent, item.id, input, {
+              leaseToken: item.lease!.token,
+            }),
+          "forbidden",
+        );
+        expect(board.getTask(admin, item.id)).toEqual(item);
+        expect(repo.events(0)).toEqual(before);
+      }
+    },
+  );
+
+  it("filters multiple statuses with the existing pagination and other filters", () => {
+    const { board, admin, agent, project, task, advance } = fixture();
+    const todo = task("Todo");
+    advance(1);
+    const running = board.claim(agent, task("Running").id).task;
+    const excluded = task("Canceled");
+    board.transition(
+      admin,
+      excluded.id,
+      { to: "canceled" },
+      { expectedVersion: excluded.version },
+    );
+    const query = {
+      projectId: project.id,
+      status: ["todo", "in_progress"] as Array<"todo" | "in_progress">,
+    };
+    expect(board.listTasks(admin, query).items).toEqual([todo, running]);
+    const first = board.listTasks(admin, { ...query, limit: 1 });
+    expect(first.items).toEqual([todo]);
+    expect(
+      board.listTasks(admin, { ...query, cursor: first.nextCursor! }).items,
+    ).toEqual([running]);
+    expect(board.listTasks(admin, { ...query, ready: true }).items).toEqual([
+      todo,
+    ]);
+    expect(board.listTasks(admin, { status: "in_progress" }).items).toEqual([
+      running,
+    ]);
+    expect(board.listTasks(admin, { status: [] }).items).toEqual([]);
+    expect(() =>
+      board.listTasks(admin, { status: JSON.parse('["todo","unknown"]') }),
+    ).toThrow();
+  });
+
+  it("embeds all links on reads only when included, independently of page limits", () => {
+    const { board, admin, agent, repo, project, task, advance } = fixture(
+      {},
+      { maxPageSize: 1 },
+    );
+    const item = board.createTask(admin, {
+      projectId: project.id,
+      accountable: admin.principal.id,
+      title: "Linked",
+      links: [
+        { kind: "thread", ref: "thread:1" },
+        { kind: "session", ref: "session:1" },
+      ],
+    });
+    advance(1);
+    const empty = task("Empty");
+    const links = repo.list("links", "task_id = ?", [item.id]);
+    const events = repo.events(0);
+    expect(board.getTask(admin, item.id)).toEqual(item);
+    expect(board.getTask(admin, item.id, { include: "links" })).toEqual({
+      ...item,
+      links,
+    });
+    expect(board.getTask(admin, empty.id, { include: "links" }).links).toEqual(
+      [],
+    );
+    expect(board.listTasks(admin, {}).items).toEqual([item]);
+    const first = board.listTasks(admin, { include: "links", limit: 1 });
+    expect(first.items).toEqual([{ ...item, links }]);
+    expect(
+      board.listTasks(admin, { include: "links", cursor: first.nextCursor! })
+        .items,
+    ).toEqual([{ ...empty, links: [] }]);
+    expectCode(
+      () =>
+        board.getTask({ ...agent, projectIds: [] }, item.id, {
+          include: "links",
+        }),
+      "forbidden",
+    );
+    expect(
+      board.listTasks({ ...agent, projectIds: [] }, { include: "links" }).items,
+    ).toEqual([]);
+    expect(repo.events(0)).toEqual(events);
+  });
+
   it("creates initial links and subtasks atomically with one idempotency key", () => {
     const f = fixture();
     const input = {

@@ -3,6 +3,28 @@ import { describe, expect, it } from "vitest";
 import { expectCode, fixture } from "./helpers.js";
 
 describe("principals and tokens", () => {
+  it("returns the current authenticated identity and access without token metadata", () => {
+    const { board, admin, agent, project } = fixture();
+    expect(board.me(admin)).toEqual(admin);
+    const issued = board.createToken(admin, {
+      principalId: agent.principal.id,
+      scopes: [],
+      projectIds: [project.id],
+    });
+    const actor = board.verifyToken(issued.secret!);
+    expect(
+      board.me({ ...actor, scopes: admin.scopes, projectIds: null }),
+    ).toEqual({
+      principal: agent.principal,
+      scopes: [],
+      projectIds: [project.id],
+    });
+    board.revokeToken(admin, issued.token.id);
+    expectCode(() => board.me(actor), "unauthorized");
+    board.disablePrincipal(admin, agent.principal.id);
+    expectCode(() => board.me(agent), "unauthorized");
+  });
+
   it("compares token expiry instants independently of ISO fractional precision", () => {
     const { board, admin, agent, now, advance, task } = fixture();
     const item = task();

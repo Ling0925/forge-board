@@ -30,6 +30,7 @@
   "packageManager": "pnpm@11.18.0",
   "scripts": {
     "build": "node scripts/build.mjs",
+    "prepare": "node scripts/build.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "biome check ."

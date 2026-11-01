@@ -13,7 +13,9 @@ import {
   linkInputSchema,
   mutationSchema,
   pageSchema,
+  removeLinkSchema,
   taskQuerySchema,
+  taskReadOptionsSchema,
   taskSchema,
   transitionSchema,
   updateTaskSchema,
@@ -82,15 +84,22 @@ export async function mcpResponse(
   }
 
   tool(
+    "board_me",
+    "Get your authenticated principal, scopes and projectIds.",
+    z.strictObject({}),
+    () => board.me(actor),
+  );
+  tool(
     "board_list",
-    "List tasks, including the dependency-aware ready queue. Optional limit defaults to maxPageSize if configured, otherwise all results; continue with nextCursor.",
+    "List tasks, including the dependency-aware ready queue. status accepts one value or an array; include:'links' embeds all links per task. Optional limit defaults to maxPageSize if configured, otherwise all results; continue with nextCursor.",
     taskQuerySchema,
     (input) => board.listTasks(actor, input),
   );
   tool(
     "board_get",
-    "Get a task. Request related collections with {limit?, cursor?}; each returns its own nextCursor.",
+    "Get a task. include:'links' embeds all links in task.links. Request related collections with {limit?, cursor?}; each returns its own nextCursor.",
     id.extend({
+      ...taskReadOptionsSchema.shape,
       dependencies: pageSchema.optional(),
       links: pageSchema.optional(),
       comments: pageSchema.optional(),
@@ -99,7 +108,7 @@ export async function mcpResponse(
       events: pageSchema.optional(),
     }),
     (input) => ({
-      task: board.getTask(actor, input.id),
+      task: board.getTask(actor, input.id, { include: input.include }),
       ...(input.dependencies && {
         dependencies: board.listDependencies(
           actor,
@@ -168,7 +177,7 @@ export async function mcpResponse(
   );
   mutate(
     "board_transition",
-    "Change status with expectedVersion or the holder's leaseToken. Approval gates return a pending approval without applying the transition.",
+    "Change status and optional progress atomically with expectedVersion or the holder's leaseToken. Approval gates save progress and return a pending approval without applying the transition.",
     id.extend(transitionSchema.shape),
     ({ id, ...input }, mutation) =>
       board.transition(actor, id, input, mutation),
@@ -189,9 +198,19 @@ export async function mcpResponse(
   );
   mutate(
     "board_link",
-    "Add a thread, session, pr, issue, url or task reference with expectedVersion and, for holders, leaseToken.",
+    "Add a thread, session, pr, issue, url or task reference with expectedVersion and, for holders, leaseToken. An existing (kind, ref) returns the existing link and unchanged task.",
     id.extend(linkInputSchema.shape),
     ({ id, ...input }, mutation) => board.addLink(actor, id, input, mutation),
+  );
+  mutate(
+    "board_unlink",
+    "Remove a link by linkId or (kind, ref) with expectedVersion and, for holders, leaseToken. A missing (kind, ref) returns the unchanged task.",
+    id.extend({
+      linkId: removeLinkSchema.options[0].shape.linkId.optional(),
+      ...removeLinkSchema.options[1].partial().shape,
+    }),
+    ({ id, ...input }, mutation) =>
+      board.removeLink(actor, id, removeLinkSchema.parse(input), mutation),
   );
 
   const transport = new WebStandardStreamableHTTPServerTransport({

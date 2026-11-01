@@ -8,6 +8,7 @@ export const transitions: Record<Status, readonly Status[]> = {
     "input_required",
     "blocked",
     "in_review",
+    "done",
     "failed",
     "canceled",
   ],

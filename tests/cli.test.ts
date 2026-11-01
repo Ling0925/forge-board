@@ -239,19 +239,35 @@ describe("built CLI", () => {
     ).toContainEqual(agent);
     const project = json(
       directory,
-      ["project", "create", "--key", "CLI", "--name", "CLI"],
+      [
+        "project",
+        "create",
+        "--key",
+        "CLI",
+        "--name",
+        "CLI",
+        "--settings",
+        '{"allowAgentCancel":true}',
+      ],
       init.secret,
     );
+    expect(project.settings).toEqual({ allowAgentCancel: true });
     expect(json(directory, ["project", "list"], init.secret).items).toEqual([
       project,
     ]);
     expect(
       json(
         directory,
-        ["project", "settings", project.id, "--settings", '{"leaseTtl":1000}'],
+        [
+          "project",
+          "settings",
+          project.id,
+          "--settings",
+          '{"leaseTtl":1000,"allowAgentCancel":false}',
+        ],
         init.secret,
       ).settings,
-    ).toEqual({ leaseTtl: 1000 });
+    ).toEqual({ leaseTtl: 1000, allowAgentCancel: false });
     const args = [
       "token",
       "create",
