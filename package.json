@@ -18,6 +18,10 @@
       "types": "./src/service/index.ts",
       "import": "./dist/service/index.js"
     },
+    "./http": {
+      "types": "./src/http/index.ts",
+      "import": "./dist/http/index.js"
+    },
     "./package.json": "./package.json"
   },
   "bin": { "forge-board": "dist/cli.js" },
@@ -37,6 +41,7 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@apidevtools/swagger-parser": "^13.1.0",
     "@biomejs/biome": "^1.9.4",
     "@types/node": "^22.14.0",
     "esbuild": "^0.25.3",

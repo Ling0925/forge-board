@@ -40,7 +40,9 @@ export const projectSettingsSchema = z.strictObject({
   approvalRequired: z.array(approvalRuleSchema).optional(),
 });
 export type ProjectSettings = z.infer<typeof projectSettingsSchema>;
+export const portSchema = z.number().int().min(0).max(65535);
 export const settingsSchema = z.strictObject({
+  port: portSchema.optional(),
   idempotencyRetention: z
     .number()
     .positive()
@@ -279,3 +281,48 @@ export const taskQuerySchema = pageSchema.extend({
   parentId: id.optional(),
 });
 export type TaskQuery = z.infer<typeof taskQuerySchema>;
+
+export const principalInputSchema = z.discriminatedUnion("kind", [
+  principalSchema.options[0].pick({ kind: true, name: true }),
+  principalSchema.options[1].pick({ kind: true, name: true, owner: true }),
+]);
+export const tokenInputSchema = tokenSchema
+  .pick({ principalId: true, scopes: true })
+  .extend(
+    tokenSchema.pick({ projectIds: true, expiresAt: true }).partial().shape,
+  );
+export const createProjectSchema = projectSchema
+  .pick({ key: true, name: true })
+  .extend({ settings: projectSettingsSchema.optional() });
+export const updateProjectSchema = projectSchema
+  .pick({ name: true, settings: true })
+  .exactPartial();
+export const transitionSchema = z.strictObject({
+  to: statusSchema,
+  message: taskSchema.shape.statusMessage.optional(),
+});
+export const linkInputSchema = linkSchema
+  .pick({ kind: true, ref: true })
+  .extend({ title: linkSchema.shape.title.unwrap().optional() });
+export const commentInputSchema = commentSchema
+  .pick({ kind: true, body: true })
+  .extend({ replyTo: commentSchema.shape.replyTo.unwrap().optional() });
+export const artifactInputSchema = artifactSchema.pick({
+  name: true,
+  mediaType: true,
+  content: true,
+});
+export const approvalDecisionSchema = approvalSchema.shape.state.exclude([
+  "pending",
+]);
+export const eventFilterSchema = z.strictObject({
+  after: z.number().int().nonnegative().optional(),
+  projectId: projectSchema.shape.id.optional(),
+  taskId: taskSchema.shape.id.optional(),
+});
+export const eventQuerySchema = pageSchema.extend(eventFilterSchema.shape);
+export const approvalQuerySchema = pageSchema.extend({
+  projectId: projectSchema.shape.id.optional(),
+  taskId: taskSchema.shape.id.optional(),
+  state: approvalSchema.shape.state.optional(),
+});

@@ -100,6 +100,7 @@ describe("domain contracts", () => {
 
   it("keeps stable error codes and transport-neutral status mapping", () => {
     expect(errorStatuses).toEqual({
+      validation_error: 422,
       not_found: 404,
       forbidden: 403,
       unauthorized: 401,

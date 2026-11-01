@@ -1,4 +1,5 @@
 export const errorStatuses = {
+  validation_error: 422,
   not_found: 404,
   forbidden: 403,
   unauthorized: 401,
@@ -15,7 +16,7 @@ export const errorStatuses = {
 export type ErrorCode = keyof typeof errorStatuses;
 
 export class BoardError extends Error {
-  readonly status: number;
+  readonly status: (typeof errorStatuses)[ErrorCode];
 
   constructor(
     readonly code: ErrorCode,

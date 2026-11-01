@@ -8,11 +8,9 @@ import {
   type Approval,
   type Artifact,
   BoardError,
-  type Comment,
   type CreateTask,
   DEFAULT_WORKSPACE_ID,
   type Event,
-  type Link,
   type Mutation,
   type Page,
   type PageInput,
@@ -24,25 +22,30 @@ import {
   type TaskQuery,
   type UpdateTask,
   actorSchema,
-  artifactContentSchema,
+  approvalDecisionSchema,
+  approvalQuerySchema,
+  artifactInputSchema,
   assertTransition,
-  commentKindSchema,
+  commentInputSchema,
+  createProjectSchema,
   createTaskSchema,
+  eventFilterSchema,
+  eventQuerySchema,
   isTerminal,
-  linkKindSchema,
+  linkInputSchema,
   mayAssign,
   mayReclaim,
   mutationSchema,
   needsApproval,
   pageSchema,
+  principalInputSchema,
   principalSchema,
-  projectSchema,
-  projectSettingsSchema,
   scopeSchema,
   settingsSchema,
-  statusSchema,
   taskQuerySchema,
-  timestampSchema,
+  tokenInputSchema,
+  transitionSchema,
+  updateProjectSchema,
   updateTaskSchema,
 } from "../domain/index.js";
 import {
@@ -59,20 +62,6 @@ type BoardOptions = (
 ) & { now?: () => number };
 export type TransitionResult = { task: Task; approval: Approval | null };
 
-const tokenInputSchema = z.strictObject({
-  principalId: z.string(),
-  scopes: z.array(scopeSchema),
-  projectIds: z.array(z.string()).nullable().optional(),
-  expiresAt: timestampSchema.nullable().optional(),
-});
-const principalInputSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("human"), name: z.string() }),
-  z.strictObject({
-    kind: z.literal("agent"),
-    name: z.string(),
-    owner: z.string(),
-  }),
-]);
 const hash = (value: string) =>
   createHash("sha256").update(value).digest("hex");
 
@@ -106,6 +95,16 @@ export function createBoard(options: BoardOptions) {
     initializeDatabase(db);
   }
   const repo = createRepository(db);
+  const listeners = new Set<() => void>();
+  let pendingEvents = 0;
+
+  function commit<T>(action: () => T): T {
+    pendingEvents = 0;
+    const result = transaction(db, action);
+    if (pendingEvents > 0) for (const listener of listeners) listener();
+    return result;
+  }
+
   const at = () => new Date(now()).toISOString();
   const id = (prefix: string) => newId(prefix, now());
 
@@ -217,6 +216,7 @@ export function createBoard(options: BoardOptions) {
       data,
       at: at(),
     });
+    pendingEvents++;
   }
 
   function expired(actor: Actor, task: Task): Task {
@@ -253,7 +253,7 @@ export function createBoard(options: BoardOptions) {
     } = {},
   ): T {
     const mutation = mutationSchema.parse(input);
-    const result = transaction(db, () => {
+    const result = commit(() => {
       const actor = authenticate(inputActor);
       authorize(actor, scope);
       context.access?.(actor);
@@ -289,6 +289,7 @@ export function createBoard(options: BoardOptions) {
       }
       for (const taskId of context.taskIds ?? [])
         expired(actor, taskFor(actor, taskId, scope));
+      const beforeMutation = pendingEvents;
       db.exec("SAVEPOINT mutation");
       try {
         const value = action(actor, mutation);
@@ -304,6 +305,7 @@ export function createBoard(options: BoardOptions) {
         return { ok: true as const, value };
       } catch (error) {
         db.exec("ROLLBACK TO mutation; RELEASE mutation");
+        pendingEvents = beforeMutation;
         return { ok: false as const, error };
       }
     });
@@ -316,7 +318,7 @@ export function createBoard(options: BoardOptions) {
     scope: Scope,
     action: (actor: Actor) => T,
   ): T {
-    return transaction(db, () => {
+    return commit(() => {
       const actor = authenticate(inputActor);
       authorize(actor, scope);
       return action(actor);
@@ -594,7 +596,117 @@ export function createBoard(options: BoardOptions) {
     return { task: updated, approval: null };
   }
 
+  function eventsFor(
+    actor: Actor,
+    query: z.infer<typeof eventFilterSchema>,
+  ): Event[] {
+    if (query.projectId !== undefined)
+      authorize(actor, "tasks:read", query.projectId);
+    if (query.taskId !== undefined) taskFor(actor, query.taskId, "tasks:read");
+    return repo
+      .events(query.after ?? 0)
+      .filter(
+        (event) =>
+          visible(actor, event.projectId) &&
+          (query.projectId === undefined ||
+            event.projectId === query.projectId) &&
+          (query.taskId === undefined || event.taskId === query.taskId),
+      );
+  }
+
+  function issueToken(actor: Actor, data: z.infer<typeof tokenInputSchema>) {
+    principal(data.principalId);
+    const projectIds = data.projectIds ?? null;
+    for (const projectId of projectIds ?? [])
+      required(repo.get("projects", projectId), "Project");
+    const secret = `fbt_${randomBytes(32).toString("base64url")}`;
+    const token = repo.insert("tokens", {
+      id: id("tok"),
+      workspaceId,
+      principalId: data.principalId,
+      hash: hash(secret),
+      scopes: data.scopes,
+      projectIds,
+      createdAt: at(),
+      expiresAt: data.expiresAt ?? null,
+      lastUsedAt: null,
+      revokedAt: null,
+    });
+    record(actor, "token_created", { tokenId: token.id });
+    const { hash: _, ...metadata } = token;
+    return { token: metadata, secret: secret as string | null };
+  }
+
   return {
+    settings,
+
+    initialize(name: string) {
+      z.string().parse(name);
+      return commit(() => {
+        if (repo.list("principals").length > 0)
+          throw new BoardError(
+            "conflict",
+            "Data directory is already initialized",
+          );
+        const person = repo.insert("principals", {
+          id: id("usr"),
+          workspaceId,
+          kind: "human",
+          name,
+          owner: null,
+          disabled: false,
+        });
+        const actor: Actor = {
+          principal: person,
+          scopes: [...scopeSchema.options],
+          projectIds: null,
+        };
+        record(actor, "principal_created", { principalId: person.id });
+        const token = issueToken(actor, {
+          principalId: person.id,
+          scopes: actor.scopes,
+        });
+        return {
+          workspace: required(repo.get("workspaces", workspaceId), "Workspace"),
+          principal: person,
+          ...token,
+        };
+      });
+    },
+
+    onCommit(listener: () => void) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+
+    replayEvents(actor: Actor, input: z.infer<typeof eventFilterSchema>) {
+      const query = eventFilterSchema.parse(input);
+      return read(actor, "tasks:read", (actor) => eventsFor(actor, query));
+    },
+
+    queryApprovals(actor: Actor, input: z.infer<typeof approvalQuerySchema>) {
+      const query = approvalQuerySchema.parse(input);
+      return read(actor, "tasks:read", (actor) => {
+        if (query.projectId !== undefined)
+          authorize(actor, "tasks:read", query.projectId);
+        if (query.taskId !== undefined)
+          expired(actor, taskFor(actor, query.taskId, "tasks:read"));
+        const approvals = repo.list("approvals").filter((approval) => {
+          const task = required(repo.get("tasks", approval.taskId), "Task");
+          return (
+            visible(actor, task.projectId) &&
+            (query.projectId === undefined ||
+              task.projectId === query.projectId) &&
+            (query.taskId === undefined || task.id === query.taskId) &&
+            (query.state === undefined || approval.state === query.state)
+          );
+        });
+        return paginate(approvals, query, (item) => item.id);
+      });
+    },
+
     close() {
       if (options.dataDir !== undefined) db.close();
     },
@@ -678,28 +790,7 @@ export function createBoard(options: BoardOptions) {
         "createToken",
         data,
         mutation,
-        (actor) => {
-          principal(data.principalId);
-          const projectIds = data.projectIds ?? null;
-          for (const projectId of projectIds ?? [])
-            required(repo.get("projects", projectId), "Project");
-          const secret = `fbt_${randomBytes(32).toString("base64url")}`;
-          const token = repo.insert("tokens", {
-            id: id("tok"),
-            workspaceId,
-            principalId: data.principalId,
-            hash: hash(secret),
-            scopes: data.scopes,
-            projectIds,
-            createdAt: at(),
-            expiresAt: data.expiresAt ?? null,
-            lastUsedAt: null,
-            revokedAt: null,
-          });
-          record(actor, "token_created", { tokenId: token.id });
-          const { hash: _, ...metadata } = token;
-          return { token: metadata, secret: secret as string | null };
-        },
+        (actor) => issueToken(actor, data),
         {
           access: (actor) => tokenScope(actor, data.projectIds ?? null),
           redactReplay: (result) => ({ ...result, secret: null }),
@@ -708,7 +799,7 @@ export function createBoard(options: BoardOptions) {
     },
 
     verifyToken(secret: string): Actor {
-      return transaction(db, () => {
+      return commit(() => {
         const token = repo.list("tokens", "hash = ?", [hash(secret)])[0];
         if (
           !token ||
@@ -778,15 +869,10 @@ export function createBoard(options: BoardOptions) {
 
     createProject(
       actor: Actor,
-      input: Pick<z.infer<typeof projectSchema>, "key" | "name"> & {
-        settings?: ProjectSettings;
-      },
+      input: z.input<typeof createProjectSchema>,
       mutation: Mutation = {},
     ) {
-      const data = projectSchema
-        .pick({ key: true, name: true })
-        .extend({ settings: projectSettingsSchema.optional() })
-        .parse(input);
+      const data = createProjectSchema.parse(input);
       return write(
         actor,
         "projects:admin",
@@ -821,10 +907,7 @@ export function createBoard(options: BoardOptions) {
       input: { name?: string; settings?: ProjectSettings },
       mutation: Mutation = {},
     ) {
-      const data = projectSchema
-        .pick({ name: true, settings: true })
-        .exactPartial()
-        .parse(input);
+      const data = updateProjectSchema.parse(input);
       return write(
         actor,
         "projects:admin",
@@ -996,7 +1079,6 @@ export function createBoard(options: BoardOptions) {
         { projectId },
         mutation,
         (actor, mutation) => {
-          authorize(actor, "tasks:claim", projectId);
           projectSettings(projectId);
           const candidates = repo
             .list("tasks", "project_id = ?", [projectId])
@@ -1013,6 +1095,7 @@ export function createBoard(options: BoardOptions) {
           const task = candidates[0];
           return task === undefined ? null : claimTask(actor, task, mutation);
         },
+        { access: (actor) => authorize(actor, "tasks:claim", projectId) },
       );
     },
 
@@ -1113,12 +1196,10 @@ export function createBoard(options: BoardOptions) {
     transition(
       actor: Actor,
       taskId: string,
-      input: { to: Status; message?: string },
+      input: z.input<typeof transitionSchema>,
       mutation: Mutation = {},
     ): TransitionResult {
-      const data = z
-        .strictObject({ to: statusSchema, message: z.string().optional() })
-        .parse(input);
+      const data = transitionSchema.parse(input);
       return write(
         actor,
         "tasks:write",
@@ -1140,7 +1221,7 @@ export function createBoard(options: BoardOptions) {
       decision: "approved" | "rejected",
       mutation: Mutation = {},
     ): TransitionResult {
-      z.enum(["approved", "rejected"]).parse(decision);
+      approvalDecisionSchema.parse(decision);
       const approval = required(repo.get("approvals", approvalId), "Approval");
       return write(
         actor,
@@ -1291,16 +1372,10 @@ export function createBoard(options: BoardOptions) {
     addLink(
       actor: Actor,
       taskId: string,
-      input: Pick<Link, "kind" | "ref"> & { title?: string },
+      input: z.input<typeof linkInputSchema>,
       mutation: Mutation,
     ) {
-      const data = z
-        .strictObject({
-          kind: linkKindSchema,
-          ref: z.string(),
-          title: z.string().optional(),
-        })
-        .parse(input);
+      const data = linkInputSchema.parse(input);
       return write(
         actor,
         "tasks:write",
@@ -1373,16 +1448,10 @@ export function createBoard(options: BoardOptions) {
     addComment(
       actor: Actor,
       taskId: string,
-      input: Pick<Comment, "kind" | "body"> & { replyTo?: string },
+      input: z.input<typeof commentInputSchema>,
       mutation: Mutation,
     ) {
-      const data = z
-        .strictObject({
-          kind: commentKindSchema,
-          body: z.string(),
-          replyTo: z.string().optional(),
-        })
-        .parse(input);
+      const data = commentInputSchema.parse(input);
       return write(
         actor,
         "tasks:write",
@@ -1449,13 +1518,7 @@ export function createBoard(options: BoardOptions) {
       input: Pick<Artifact, "name" | "mediaType" | "content">,
       mutation: Mutation,
     ) {
-      const data = z
-        .strictObject({
-          name: z.string(),
-          mediaType: z.string(),
-          content: artifactContentSchema,
-        })
-        .parse(input);
+      const data = artifactInputSchema.parse(input);
       return write(
         actor,
         "tasks:write",
@@ -1617,33 +1680,11 @@ export function createBoard(options: BoardOptions) {
 
     listEvents(
       actor: Actor,
-      input: PageInput & {
-        after?: number;
-        projectId?: string;
-        taskId?: string;
-      },
+      input: z.input<typeof eventQuerySchema>,
     ): Page<Event> {
-      const query = pageSchema
-        .extend({
-          after: z.number().int().nonnegative().optional(),
-          projectId: z.string().optional(),
-          taskId: z.string().optional(),
-        })
-        .parse(input);
+      const query = eventQuerySchema.parse(input);
       return read(actor, "tasks:read", (actor) => {
-        if (query.projectId !== undefined)
-          authorize(actor, "tasks:read", query.projectId);
-        if (query.taskId !== undefined)
-          taskFor(actor, query.taskId, "tasks:read");
-        const events = repo
-          .events(query.after ?? 0)
-          .filter(
-            (event) =>
-              visible(actor, event.projectId) &&
-              (query.projectId === undefined ||
-                event.projectId === query.projectId) &&
-              (query.taskId === undefined || event.taskId === query.taskId),
-          );
+        const events = eventsFor(actor, query);
         return paginate(
           events,
           query,
