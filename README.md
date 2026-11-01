@@ -12,11 +12,12 @@
 git clone https://github.com/Ling0925/forge-board.git
 cd forge-board
 pnpm install --frozen-lockfile
-pnpm build
 alias forge-board='node ./dist/cli.js'
 
 forge-board init --data "$HOME/.forge-board" --name "我"
 ```
+
+安装时的 `prepare` 自动构建 `dist/`，通过 git 依赖安装也会执行；修改源码后可用 `pnpm build` 重新构建。
 
 `init` 创建数据库、`config.json`、首个人类身份及管理员 token，只能执行一次。保存输出中的 `principal.id` 和 `secret`；token 明文仅在创建时返回，数据库只存哈希。以下变量请替换为实际输出：
 
@@ -56,17 +57,23 @@ REST 位于 `/v1`，使用 `Authorization: Bearer <token>`。完整接口与 sch
 
 | 接口 | 用途 |
 | --- | --- |
+| `GET /v1/me` | 当前 token 对应的 `principal`、`scopes`、`projectIds`，不返回 token 信息 |
 | `GET/POST /v1/projects`、`GET/PATCH /v1/projects/:id` | 项目及设置 |
 | `GET/POST /v1/tasks`、`GET/PATCH /v1/tasks/:id` | 查询、创建、更新任务 |
 | `POST /v1/tasks/:id/claim`、`POST /v1/tasks/claim-next` | 指定任务认领、从 ready 队列认领 |
 | `POST /v1/tasks/:id/release`、`/reclaim`、`/lease/renew` | 释放、人类收回、续租 |
-| `POST /v1/tasks/:id/transition` | 状态转换，审批策略可能返回 pending approval |
+| `POST /v1/tasks/:id/transition` | `{to, message?, progress?}`；状态与进度原子写入，审批策略可能返回 pending approval |
 | `GET/POST /v1/tasks/:id/comments`、`/artifacts`、`/links` | 评论、产物、外部引用 |
+| `DELETE /v1/tasks/:id/links` | 请求体 `{linkId}` 或 `{kind, ref}` |
 | `GET/POST/DELETE /v1/tasks/:id/dependencies` | 依赖 DAG |
 | `GET /v1/approvals`、`POST /v1/approvals/:id/decide` | 查询审批、人类决策 |
 | `GET /v1/events` | 事件分页，或 SSE 订阅 |
 
 REST、MCP、CLI 和网页的列表均可省略 `limit`（CLI 为 `--limit`）：配置了 `maxPageSize` 时使用该值，否则返回全部结果；显式传入的 `limit` 仍受 `maxPageSize` 限制。响应为 `{items, nextCursor}`；用 `cursor=nextCursor` 继续。任务可按 `project`、`status`、`assignee`、`label`、`link`、`parentId`、`ready=true` 过滤。`ready` 表示 todo、依赖全部完成且没有有效租约。
+
+`status` 支持单值或逗号分隔的多个状态，例如 `status=todo,in_progress`；未知状态返回校验错误。`GET /v1/tasks/:id` 和 `GET /v1/tasks` 可用 `include=links` 在每个任务中附带完整的 `links` 数组，不受分页限制；省略时响应不变。
+
+添加已有 `(kind, ref)` 的 link 返回原 link 和未变更的任务（不更新 title）；按 `(kind, ref)` 删除不存在的 link 返回未变更的任务。这两种情况均不增加任务版本或任务事件，仍需满足原有权限、版本与租约检查。按未知 `linkId` 删除仍返回 404。
 
 创建时可附带 `links` 和 `subtasks`，与父任务在同一事务内写入；返回父任务，子任务通过 `parentId` 查询。子任务继承项目和默认负责人，可单独指定人类 `accountable`。
 
@@ -95,16 +102,18 @@ SSE 的 `id` 是全局递增事件序号；用 `Last-Event-ID` 或 `after` 续�
 
 | 工具 | 参数要点 |
 | --- | --- |
-| `board_list` | 可选 `limit`、`cursor`、`projectId`、`ready`、`status`、`link` 等过滤项 |
-| `board_get` | `id`；可选 `comments`、`artifacts`、`links`、`dependencies`、`approvals`、`events`，各传 `{limit?, cursor?}`（可用 `{}`） |
+| `board_me` | 无参数；返回当前身份及 `scopes`、`projectIds` |
+| `board_list` | 可选 `limit`、`cursor`、`projectId`、`ready`、`status`（单值或数组）、`link` 等过滤项；`include:"links"` 内嵌完整关联 |
+| `board_get` | `id`，可选 `include:"links"`；可选 `comments`、`artifacts`、`links`、`dependencies`、`approvals`、`events`，各传 `{limit?, cursor?}`（可用 `{}`） |
 | `board_create` | `projectId`、`title`、`accountable`，可选 `links`、`subtasks` 等 |
 | `board_update` | `id` 和待更新字段，`expectedVersion` |
 | `board_claim` | `{id}` 或 `{next:true, projectId}`；没有 ready 任务返回 null |
 | `board_release` | `id`、`leaseToken` |
-| `board_transition` | `id`、`to`、可选 `message` |
+| `board_transition` | `id`、`to`、可选 `message`、`progress` |
 | `board_comment` | `id`、`kind`、`body`，回答用 `replyTo` 指向问题 |
 | `board_artifact` | `id`、`name`、`mediaType`、`content: {uri, text:null}` 或 `{uri:null, text}` |
 | `board_link` | `id`、`kind`、`ref`、可选 `title` |
+| `board_unlink` | `id`，以及 `linkId` 或 `kind` + `ref` |
 
 所有变更工具接受可选 `idempotencyKey`，版本、租约规则与 REST 相同（参数 `expectedVersion`、`leaseToken`）。工具结果是 JSON 文本；领域错误返回 `isError: true` 和 `{error:{code,status,message,details}}`。`board_get` 返回 `{task, ...请求的关联分页}`，各分页有自己的 `nextCursor`。子任务用 `board_list` 的 `parentId` 查询。
 
@@ -157,7 +166,7 @@ forge-board approvals approve '<approval id>' --data "$DATA" --token "$ADMIN_TOK
 # 拒绝时把 approve 改为 reject。
 ```
 
-远程对应 `POST /v1/approvals/:id/decide`，请求体 `{"decision":"approved"}` 或 `{"decision":"rejected"}`，同时传 `If-Match`。审批通过与状态转换在同一事务内执行。
+远程对应 `POST /v1/approvals/:id/decide`，请求体 `{"decision":"approved"}` 或 `{"decision":"rejected"}`，同时传 `If-Match`。审批通过与状态转换在同一事务内执行。转换请求携带的 `progress` 与 `approval_requested` 同次保存，状态及 message 等待审批。
 
 ## 设置与决策
 
@@ -168,11 +177,14 @@ forge-board approvals approve '<approval id>' --data "$DATA" --token "$ADMIN_TOK
 | `leaseTtl` | 项目 | 不过期；设置为正数毫秒后，持有者写入续租，读/认领时惰性检查过期并记录事件 |
 | `approvalRequired` | 项目 | 无审批门禁；数组如 `["in_review->done", "*->canceled"]` |
 | `allowAgentAssignment` | 项目 | false；开启后也只允许同一个 owner 下的 agent 互相指派，并需 `tasks:assign` |
+| `allowAgentCancel` | 项目 | false；开启后 agent 可按普通写入与租约规则取消任务，仍受审批策略约束；关闭时仍可请求由人批准的取消 |
 | `idempotencyRetention` | config.json | 永久保留；设置为正数毫秒后，写入时惰性清理旧记录 |
 | `maxPageSize` | config.json | 无最大值；设置为正整数以限制单个响应内存占用，超过时返回该大小的页面和续页游标 |
 | `port` | config.json | 无默认值；可被 `serve --port` 覆盖 |
 
 人和 agent 共用 Task；agent 必须有一个人类 owner，负责人 `accountable` 和审批人始终是人。状态为 `todo`、`in_progress`、`input_required`、`blocked`、`in_review`、`done`、`failed`、`canceled`；`ready` 是查询。`question` 评论会请求输入，指向问题的 `answer` 在任务等待输入时恢复 `in_progress`。依赖不能成环，产物按名称递增版本。默认无后台租约回收定时器；人类负责人、持有 agent 的 owner 或项目管理员可显式收回租约。
+
+默认允许 `in_progress → done`，无需经过 `in_review`；项目的 `approvalRequired` 按原规则匹配（例如 `*->done` 覆盖所有完成转换，`in_review->done` 只覆盖该路径）。转换可同时更新 `status`、`statusMessage` 和 `progress`，只增加一次版本并产生一条任务事件；省略 `progress` 时保留原值。
 
 SQLite 事务统一处理领域规则和事件，REST/MCP 是薄封装；MCP 使用普通 tools，不使用 MCP Tasks 扩展。第 1 阶段只有一个 workspace，所有表预留 `workspace_id`。网页保持只读，审批走 CLI/REST。
 

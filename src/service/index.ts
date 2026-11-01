@@ -40,9 +40,12 @@ import {
   pageSchema,
   principalInputSchema,
   principalSchema,
+  removeLinkSchema,
   scopeSchema,
   settingsSchema,
   taskQuerySchema,
+  taskReadOptionsSchema,
+  type taskReadSchema,
   tokenInputSchema,
   transitionSchema,
   updateProjectSchema,
@@ -509,7 +512,11 @@ export function createBoard(options: BoardOptions) {
       });
       return { task: updated, approval };
     }
-    if (to === "canceled" && actor.principal.kind !== "human")
+    if (
+      to === "canceled" &&
+      actor.principal.kind !== "human" &&
+      projectSettings(task.projectId).allowAgentCancel !== true
+    )
       throw new BoardError("forbidden", "Only a human may cancel a task");
     return { task: applyTransition(actor, task, to, message), approval: null };
   }
@@ -527,7 +534,10 @@ export function createBoard(options: BoardOptions) {
       .map((task) => expired(actor, task))
       .filter(
         (task) =>
-          (query.status === undefined || task.status === query.status) &&
+          (query.status === undefined ||
+            (Array.isArray(query.status)
+              ? query.status.includes(task.status)
+              : task.status === query.status)) &&
           (query.assignee === undefined || task.assignee === query.assignee) &&
           (query.parentId === undefined || task.parentId === query.parentId) &&
           (query.label === undefined || task.labels.includes(query.label)) &&
@@ -695,8 +705,22 @@ export function createBoard(options: BoardOptions) {
     });
   }
 
+  function includeLinks(
+    task: Task,
+    options: z.infer<typeof taskReadOptionsSchema>,
+  ): z.infer<typeof taskReadSchema> {
+    return options.include === "links"
+      ? { ...task, links: repo.list("links", "task_id = ?", [task.id]) }
+      : task;
+  }
+
   return {
     settings,
+
+    me(actor: Actor) {
+      const { principal, scopes, projectIds } = authenticate(actor);
+      return { principal, scopes, projectIds };
+    },
 
     initialize(name: string) {
       z.string().parse(name);
@@ -1024,16 +1048,27 @@ export function createBoard(options: BoardOptions) {
       );
     },
 
-    getTask(actor: Actor, taskId: string): Task {
+    getTask(
+      actor: Actor,
+      taskId: string,
+      input: z.input<typeof taskReadOptionsSchema> = {},
+    ): z.infer<typeof taskReadSchema> {
+      const options = taskReadOptionsSchema.parse(input);
       return read(actor, "tasks:read", (actor) =>
-        expired(actor, taskFor(actor, taskId, "tasks:read")),
+        includeLinks(
+          expired(actor, taskFor(actor, taskId, "tasks:read")),
+          options,
+        ),
       );
     },
 
-    listTasks(actor: Actor, input: TaskQuery): Page<Task> {
+    listTasks(
+      actor: Actor,
+      input: TaskQuery,
+    ): Page<z.infer<typeof taskReadSchema>> {
       const query = taskQuerySchema.parse(input);
-      return read(actor, "tasks:read", (actor) =>
-        paginate(
+      return read(actor, "tasks:read", (actor) => {
+        const page = paginate(
           queryTasks(actor, query),
           query,
           (task) => JSON.stringify([task.priority, task.id]),
@@ -1046,8 +1081,12 @@ export function createBoard(options: BoardOptions) {
               (task.priority === priority && task.id > id)
             );
           },
-        ),
-      );
+        );
+        return {
+          ...page,
+          items: page.items.map((task) => includeLinks(task, query)),
+        };
+      });
     },
 
     updateTask(
@@ -1245,7 +1284,14 @@ export function createBoard(options: BoardOptions) {
         (actor, mutation) => {
           const task = taskFor(actor, taskId, "tasks:write");
           checkWrite(actor, task, mutation, true);
-          return transitionTask(actor, task, data.to, data.message ?? "");
+          return transitionTask(
+            actor,
+            data.progress === undefined
+              ? task
+              : { ...task, progress: data.progress },
+            data.to,
+            data.message ?? "",
+          );
         },
         { taskIds: [taskId] },
       );
@@ -1421,6 +1467,12 @@ export function createBoard(options: BoardOptions) {
         (actor, mutation) => {
           const task = taskFor(actor, taskId, "tasks:write");
           checkWrite(actor, task, mutation);
+          const existing = repo.list(
+            "links",
+            "task_id = ? AND kind = ? AND ref = ?",
+            [taskId, data.kind, data.ref],
+          )[0];
+          if (existing) return { link: existing, task };
           const link = insertLink(taskId, data);
           return {
             link,
@@ -1434,23 +1486,32 @@ export function createBoard(options: BoardOptions) {
     removeLink(
       actor: Actor,
       taskId: string,
-      linkId: string,
+      input: z.input<typeof removeLinkSchema>,
       mutation: Mutation,
     ) {
+      const data = removeLinkSchema.parse(input);
       return write(
         actor,
         "tasks:write",
         "removeLink",
-        { taskId, linkId },
+        { taskId, ...data },
         mutation,
         (actor, mutation) => {
           const task = taskFor(actor, taskId, "tasks:write");
           checkWrite(actor, task, mutation);
-          const link = required(repo.get("links", linkId), "Link");
+          const link =
+            "linkId" in data
+              ? required(repo.get("links", data.linkId), "Link")
+              : repo.list("links", "task_id = ? AND kind = ? AND ref = ?", [
+                  taskId,
+                  data.kind,
+                  data.ref,
+                ])[0];
+          if (!link) return task;
           if (link.taskId !== taskId)
             throw new BoardError("not_found", "Link not found on task");
-          repo.remove("links", linkId);
-          return saveTask(actor, task, "link_removed", { linkId });
+          repo.remove("links", link.id);
+          return saveTask(actor, task, "link_removed", { linkId: link.id });
         },
         { taskIds: [taskId] },
       );

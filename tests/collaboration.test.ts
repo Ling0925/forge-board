@@ -2,6 +2,136 @@ import { describe, expect, it } from "vitest";
 import { expectCode, fixture } from "./helpers.js";
 
 describe("comments, artifacts, links, and labels", () => {
+  it("returns duplicate links unchanged and removes by kind/ref idempotently", () => {
+    const { board, admin, agent, repo, task, advance } = fixture({
+      leaseTtl: 1000,
+    });
+    const item = board.claim(agent, task().id).task;
+    const input = { kind: "thread" as const, ref: "shared", title: "Original" };
+    const linked = board.addLink(agent, item.id, input, {
+      expectedVersion: item.version,
+      leaseToken: item.lease!.token,
+    });
+    const events = repo.events(0);
+    advance(1);
+    const mutation = {
+      expectedVersion: linked.task.version,
+      leaseToken: item.lease!.token,
+    };
+    expect(
+      board.addLink(agent, item.id, { ...input, title: "Ignored" }, mutation),
+    ).toEqual(linked);
+    expect(board.getTask(admin, item.id)).toEqual(linked.task);
+    expect(repo.events(0)).toEqual(events);
+    expectCode(
+      () =>
+        board.addLink(agent, item.id, input, {
+          ...mutation,
+          expectedVersion: item.version,
+        }),
+      "version_mismatch",
+    );
+    expectCode(
+      () =>
+        board.addLink(agent, item.id, input, {
+          expectedVersion: linked.task.version,
+        }),
+      "lease_lost",
+    );
+    const otherKind = board.addLink(
+      agent,
+      item.id,
+      { kind: "session", ref: input.ref },
+      mutation,
+    );
+    const otherTask = task("Other");
+    const otherLink = board.addLink(admin, otherTask.id, input, {
+      expectedVersion: otherTask.version,
+    });
+    const removed = board.removeLink(
+      agent,
+      item.id,
+      { kind: input.kind, ref: input.ref },
+      { ...mutation, expectedVersion: otherKind.task.version },
+    );
+    expect(removed.version).toBe(otherKind.task.version + 1);
+    expect(board.listLinks(admin, item.id, {}).items).toEqual([otherKind.link]);
+    expect(board.listLinks(admin, otherTask.id, {}).items).toEqual([
+      otherLink.link,
+    ]);
+    const afterRemoval = repo.events(0);
+    const currentMutation = { ...mutation, expectedVersion: removed.version };
+    expect(
+      board.removeLink(
+        agent,
+        item.id,
+        { kind: input.kind, ref: input.ref },
+        currentMutation,
+      ),
+    ).toEqual(removed);
+    expect(repo.events(0)).toEqual(afterRemoval);
+    expectCode(
+      () =>
+        board.removeLink(
+          agent,
+          item.id,
+          { linkId: linked.link.id },
+          currentMutation,
+        ),
+      "not_found",
+    );
+    expectCode(
+      () =>
+        board.removeLink(
+          agent,
+          item.id,
+          { linkId: otherLink.link.id },
+          currentMutation,
+        ),
+      "not_found",
+    );
+    expectCode(
+      () =>
+        board.removeLink(
+          agent,
+          item.id,
+          { kind: input.kind, ref: input.ref },
+          { ...currentMutation, expectedVersion: item.version },
+        ),
+      "version_mismatch",
+    );
+    expectCode(
+      () =>
+        board.removeLink(
+          agent,
+          item.id,
+          { kind: input.kind, ref: input.ref },
+          { expectedVersion: removed.version },
+        ),
+      "lease_lost",
+    );
+    expectCode(
+      () =>
+        board.removeLink(
+          { ...agent, scopes: ["tasks:read"] },
+          item.id,
+          { kind: input.kind, ref: input.ref },
+          currentMutation,
+        ),
+      "forbidden",
+    );
+    expectCode(
+      () =>
+        board.addLink(
+          { ...agent, projectIds: [] },
+          item.id,
+          { kind: "session", ref: input.ref },
+          currentMutation,
+        ),
+      "forbidden",
+    );
+  });
+
   it("allows questions on todo, blocked, and in-review tasks", () => {
     const { board, admin, task } = fixture();
     for (const status of ["todo", "blocked", "in_review"] as const) {
@@ -200,17 +330,27 @@ describe("comments, artifacts, links, and labels", () => {
     const links = board.listLinks(admin, item.id, { limit: 100 }).items;
     expect(links).toHaveLength(6);
     const link = links.find((link) => link.kind === "thread")!;
-    item = board.removeLink(admin, item.id, link.id, {
-      expectedVersion: item.version,
-    });
+    item = board.removeLink(
+      admin,
+      item.id,
+      { linkId: link.id },
+      {
+        expectedVersion: item.version,
+      },
+    );
     expect(
       board.listTasks(admin, { limit: 100, link: "thread:reference" }).items,
     ).toEqual([]);
     expectCode(
       () =>
-        board.removeLink(admin, item.id, link.id, {
-          expectedVersion: item.version,
-        }),
+        board.removeLink(
+          admin,
+          item.id,
+          { linkId: link.id },
+          {
+            expectedVersion: item.version,
+          },
+        ),
       "not_found",
     );
   });

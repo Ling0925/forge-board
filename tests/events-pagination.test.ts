@@ -115,9 +115,14 @@ describe("events, cursor pagination, and configuration", () => {
       ).task;
     }
     const first = board.listLinks(admin, item.id, { limit: 1 });
-    board.removeLink(admin, item.id, first.items[0]!.id, {
-      expectedVersion: item.version,
-    });
+    board.removeLink(
+      admin,
+      item.id,
+      { linkId: first.items[0]!.id },
+      {
+        expectedVersion: item.version,
+      },
+    );
     expect(
       board
         .listLinks(admin, item.id, { limit: 10, cursor: first.nextCursor! })

@@ -37,6 +37,7 @@ export const projectSettingsSchema = z.strictObject({
     .optional()
     .describe("Lease duration in milliseconds; omitted means no expiry"),
   allowAgentAssignment: z.boolean().optional(),
+  allowAgentCancel: z.boolean().optional(),
   approvalRequired: z.array(approvalRuleSchema).optional(),
 });
 export type ProjectSettings = z.infer<typeof projectSettingsSchema>;
@@ -151,6 +152,16 @@ export const linkSchema = z.strictObject({
   title: z.string().nullable(),
 });
 export type Link = z.infer<typeof linkSchema>;
+export const taskReadSchema = taskSchema.extend({
+  links: z.array(linkSchema).optional(),
+});
+export const taskReadOptionsSchema = z.strictObject({
+  include: z.literal("links").optional(),
+});
+export const removeLinkSchema = z.union([
+  z.strictObject({ linkId: linkSchema.shape.id }),
+  linkSchema.pick({ kind: true, ref: true }),
+]);
 export const commentKindSchema = z.enum([
   "comment",
   "question",
@@ -285,8 +296,9 @@ export const updateTaskSchema = taskSchema
   .exactPartial();
 export type UpdateTask = z.infer<typeof updateTaskSchema>;
 export const taskQuerySchema = pageSchema.extend({
+  ...taskReadOptionsSchema.shape,
   projectId: id.optional(),
-  status: statusSchema.optional(),
+  status: z.union([statusSchema, z.array(statusSchema)]).optional(),
   assignee: id.optional(),
   label: id.optional(),
   link: z.string().optional(),
@@ -313,6 +325,7 @@ export const updateProjectSchema = projectSchema
 export const transitionSchema = z.strictObject({
   to: statusSchema,
   message: taskSchema.shape.statusMessage.optional(),
+  progress: taskSchema.shape.progress.optional(),
 });
 export const commentInputSchema = commentSchema
   .pick({ kind: true, body: true })

@@ -5,6 +5,286 @@ import { fixture } from "./helpers.js";
 import { call, connectMcp, serveBoard, toolData } from "./transport-helpers.js";
 
 describe("MCP Streamable HTTP", () => {
+  it("exposes the authenticated identity without task scopes or token data", async () => {
+    const f = fixture();
+    const token = f.board.createToken(f.admin, {
+      principalId: f.agent.principal.id,
+      scopes: [],
+      projectIds: [f.project.id],
+    });
+    const server = await serveBoard(f.board);
+    const client = await connectMcp(server.url, token.secret!);
+    try {
+      expect(await call(client, "board_me", {})).toEqual({
+        principal: f.agent.principal,
+        scopes: [],
+        projectIds: [f.project.id],
+      });
+      f.board.revokeToken(f.admin, token.token.id);
+      await expect(
+        client.callTool({ name: "board_me", arguments: {} }),
+      ).rejects.toMatchObject({ code: 401 });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("transitions atomically with progress, including approval requests and configured cancellation", async () => {
+    const f = fixture();
+    const token = f.board.createToken(f.admin, {
+      principalId: f.agent.principal.id,
+      scopes: f.agent.scopes,
+    }).secret!;
+    const server = await serveBoard(f.board);
+    const client = await connectMcp(server.url, token);
+    try {
+      const item = f.board.claim(f.agent, f.task().id).task;
+      const before = f.repo.events(0).at(-1)!.seq;
+      const done = await call(client, "board_transition", {
+        id: item.id,
+        to: "done",
+        message: "Shipped",
+        progress: "Complete",
+        leaseToken: item.lease!.token,
+      });
+      expect(done.task).toMatchObject({
+        status: "done",
+        statusMessage: "Shipped",
+        progress: "Complete",
+        version: item.version + 1,
+        lease: null,
+      });
+      expect(
+        f.repo
+          .events(before)
+          .filter((event) => event.taskId !== null)
+          .map((event) => event.type),
+      ).toEqual(["task_transitioned"]);
+
+      f.board.updateProject(f.admin, f.project.id, {
+        settings: { approvalRequired: ["*->done"] },
+      });
+      const gated = f.board.claim(f.agent, f.task().id).task;
+      const beforeApproval = f.repo.events(0).at(-1)!.seq;
+      const pending = await call(client, "board_transition", {
+        id: gated.id,
+        to: "done",
+        message: "Ready",
+        progress: "Review this",
+        leaseToken: gated.lease!.token,
+      });
+      expect(pending.task).toMatchObject({
+        status: "in_progress",
+        statusMessage: gated.statusMessage,
+        progress: "Review this",
+        version: gated.version + 1,
+      });
+      expect(
+        f.repo
+          .events(beforeApproval)
+          .filter((event) => event.taskId !== null)
+          .map((event) => event.type),
+      ).toEqual(["approval_requested"]);
+      expect(
+        f.board.decideApproval(f.admin, pending.approval.id, "approved", {
+          expectedVersion: pending.task.version,
+        }).task,
+      ).toMatchObject({
+        status: "done",
+        statusMessage: "Ready",
+        progress: "Review this",
+      });
+
+      const cancel = f.board.claim(f.agent, f.task().id).task;
+      const args = {
+        id: cancel.id,
+        to: "canceled",
+        leaseToken: cancel.lease!.token,
+      };
+      const denied = await client.callTool({
+        name: "board_transition",
+        arguments: args,
+      });
+      expect(denied.isError).toBe(true);
+      expect(toolData(denied as CallToolResult).error.code).toBe("forbidden");
+      f.board.updateProject(f.admin, f.project.id, {
+        settings: { allowAgentCancel: true },
+      });
+      expect((await call(client, "board_transition", args)).task.status).toBe(
+        "canceled",
+      );
+      f.board.updateProject(f.admin, f.project.id, {
+        settings: { allowAgentCancel: true, approvalRequired: ["*->canceled"] },
+      });
+      const gatedCancel = f.board.claim(f.agent, f.task().id).task;
+      const requested = await call(client, "board_transition", {
+        id: gatedCancel.id,
+        to: "canceled",
+        leaseToken: gatedCancel.lease!.token,
+      });
+      expect(requested.task.status).toBe("in_progress");
+      expect(requested.approval.state).toBe("pending");
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("supports duplicate links, all-link reads, status arrays and both unlink selectors", async () => {
+    const f = fixture({}, { maxPageSize: 1 });
+    const token = f.board.createToken(f.admin, {
+      principalId: f.agent.principal.id,
+      scopes: f.agent.scopes,
+    }).secret!;
+    const task = f.task("Linked");
+    f.advance(1);
+    const running = f.board.claim(f.agent, f.task("Running").id).task;
+    const excluded = f.task("Canceled");
+    f.board.transition(
+      f.admin,
+      excluded.id,
+      { to: "canceled" },
+      { expectedVersion: excluded.version },
+    );
+    const server = await serveBoard(f.board);
+    const client = await connectMcp(server.url, token);
+    try {
+      const input = {
+        id: task.id,
+        kind: "thread",
+        ref: "thread:mcp",
+        title: "Original",
+      };
+      const linked = await call(client, "board_link", {
+        ...input,
+        expectedVersion: task.version,
+      });
+      const before = f.repo.events(0).filter((event) => event.taskId !== null);
+      expect(
+        await call(client, "board_link", {
+          ...input,
+          title: "Ignored",
+          expectedVersion: linked.task.version,
+        }),
+      ).toEqual(linked);
+      expect(f.repo.events(0).filter((event) => event.taskId !== null)).toEqual(
+        before,
+      );
+      const second = await call(client, "board_link", {
+        id: task.id,
+        kind: "session",
+        ref: input.ref,
+        expectedVersion: linked.task.version,
+      });
+      const links = f.repo.list("links", "task_id = ?", [task.id]);
+      expect(await call(client, "board_get", { id: task.id })).toEqual({
+        task: second.task,
+      });
+      const detail = await call(client, "board_get", {
+        id: task.id,
+        include: "links",
+        links: {},
+      });
+      expect(detail.task).toEqual({ ...second.task, links });
+      expect(detail.links.items).toHaveLength(1);
+      const query = {
+        status: ["todo", "in_progress"],
+        include: "links",
+        limit: 1,
+      };
+      const first = await call(client, "board_list", query);
+      expect(first.items).toEqual([{ ...second.task, links }]);
+      expect(
+        await call(client, "board_list", {
+          ...query,
+          cursor: first.nextCursor,
+        }),
+      ).toEqual({ items: [{ ...running, links: [] }], nextCursor: null });
+      expect(
+        (await call(client, "board_list", { status: "in_progress" })).items,
+      ).toEqual([running]);
+      const removed = await call(client, "board_unlink", {
+        id: task.id,
+        kind: input.kind,
+        ref: input.ref,
+        expectedVersion: second.task.version,
+      });
+      expect(removed.version).toBe(second.task.version + 1);
+      const afterRemoval = f.repo
+        .events(0)
+        .filter((event) => event.taskId !== null);
+      expect(
+        await call(client, "board_unlink", {
+          id: task.id,
+          kind: input.kind,
+          ref: input.ref,
+          expectedVersion: removed.version,
+        }),
+      ).toEqual(removed);
+      expect(f.repo.events(0).filter((event) => event.taskId !== null)).toEqual(
+        afterRemoval,
+      );
+      const missing = await client.callTool({
+        name: "board_unlink",
+        arguments: {
+          id: task.id,
+          linkId: linked.link.id,
+          expectedVersion: removed.version,
+        },
+      });
+      expect(missing.isError).toBe(true);
+      expect(toolData(missing as CallToolResult).error.code).toBe("not_found");
+      const empty = await call(client, "board_unlink", {
+        id: task.id,
+        linkId: second.link.id,
+        expectedVersion: removed.version,
+      });
+      expect(
+        (await call(client, "board_get", { id: task.id, include: "links" }))
+          .task,
+      ).toEqual({ ...empty, links: [] });
+      for (const args of [
+        {},
+        { kind: input.kind },
+        { ref: input.ref },
+        { linkId: second.link.id, kind: input.kind, ref: input.ref },
+      ])
+        expect(
+          (
+            await client.callTool({
+              name: "board_unlink",
+              arguments: {
+                id: task.id,
+                expectedVersion: empty.version,
+                ...args,
+              },
+            })
+          ).isError,
+        ).toBe(true);
+      for (const status of ["unknown", ["todo", "unknown"]])
+        expect(
+          (await client.callTool({ name: "board_list", arguments: { status } }))
+            .isError,
+        ).toBe(true);
+      for (const name of ["board_get", "board_list"])
+        expect(
+          (
+            await client.callTool({
+              name,
+              arguments: {
+                ...(name === "board_get" ? { id: task.id } : {}),
+                include: "unknown",
+              },
+            })
+          ).isError,
+        ).toBe(true);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it.each([undefined, 1])(
     "accepts omitted list and related collection limits with maxPageSize %s",
     async (maxPageSize) => {
@@ -73,6 +353,7 @@ describe("MCP Streamable HTTP", () => {
       expect(tools.map((tool) => tool.name).sort()).toEqual(
         [
           "board_list",
+          "board_me",
           "board_get",
           "board_create",
           "board_update",
@@ -82,11 +363,12 @@ describe("MCP Streamable HTTP", () => {
           "board_comment",
           "board_artifact",
           "board_link",
+          "board_unlink",
         ].sort(),
       );
       for (const tool of tools) {
         expect(tool.inputSchema.type).toBe("object");
-        if (!["board_list", "board_get"].includes(tool.name))
+        if (!["board_list", "board_get", "board_me"].includes(tool.name))
           expect(tool.inputSchema.properties).toHaveProperty("idempotencyKey");
       }
       const input = {

@@ -2,6 +2,95 @@ import { describe, expect, it } from "vitest";
 import { expectCode, fixture } from "./helpers.js";
 
 describe("human approvals", () => {
+  it.each(["in_progress->done", "*->done"] as const)(
+    "saves progress with the %s request and preserves it on approval",
+    (rule) => {
+      const { board, admin, agent, repo, task } = fixture({
+        approvalRequired: [rule],
+      });
+      const item = board.claim(agent, task().id).task;
+      const before = repo.events(0).at(-1)!.seq;
+      const pending = board.transition(
+        agent,
+        item.id,
+        { to: "done", message: "Shipped", progress: "Ready for approval" },
+        { leaseToken: item.lease!.token },
+      );
+      expect(pending.task).toEqual({
+        ...item,
+        progress: "Ready for approval",
+        version: item.version + 1,
+      });
+      expect(board.getTask(admin, item.id)).toEqual(pending.task);
+      expect(repo.events(before).map((event) => event.type)).toEqual([
+        "approval_requested",
+      ]);
+      const approved = board.decideApproval(
+        admin,
+        pending.approval!.id,
+        "approved",
+        { expectedVersion: pending.task.version },
+      );
+      expect(approved.task).toMatchObject({
+        status: "done",
+        statusMessage: "Shipped",
+        progress: "Ready for approval",
+        version: pending.task.version + 1,
+        lease: null,
+      });
+    },
+  );
+
+  it("invalidates a pending approval when only progress changes", () => {
+    const { board, admin, agent, task } = fixture({
+      approvalRequired: ["*->done"],
+    });
+    const item = board.claim(agent, task().id).task;
+    const pending = board.transition(
+      agent,
+      item.id,
+      { to: "done", progress: "Ready" },
+      { leaseToken: item.lease!.token },
+    );
+    const updated = board.updateTask(
+      agent,
+      item.id,
+      { progress: "New progress" },
+      { leaseToken: item.lease!.token },
+    );
+    expectCode(
+      () =>
+        board.decideApproval(admin, pending.approval!.id, "approved", {
+          expectedVersion: updated.version,
+        }),
+      "version_mismatch",
+    );
+  });
+
+  it("still gates agent cancellation when allowAgentCancel is enabled", () => {
+    const { board, admin, agent, task } = fixture({
+      allowAgentCancel: true,
+      approvalRequired: ["*->canceled"],
+    });
+    const item = board.claim(agent, task().id).task;
+    const pending = board.transition(
+      agent,
+      item.id,
+      { to: "canceled", progress: "Stopping" },
+      { leaseToken: item.lease!.token },
+    );
+    expect(pending.task).toMatchObject({
+      status: "in_progress",
+      progress: "Stopping",
+    });
+    expect(pending.approval?.state).toBe("pending");
+    expect(
+      board.decideApproval(admin, pending.approval!.id, "approved", {
+        expectedVersion: pending.task.version,
+      }).task,
+    ).toMatchObject({ status: "canceled", progress: "Stopping" });
+  });
+
   it("invalidates a pending approval when its task lease expires", () => {
     const { board, admin, agent, task, advance } = fixture({
       leaseTtl: 1000,
@@ -119,7 +208,7 @@ describe("human approvals", () => {
     const requested = board.transition(
       admin,
       item.id,
-      { to: "canceled" },
+      { to: "canceled", progress: "Stopping" },
       { expectedVersion: item.version },
     );
     const result = board.decideApproval(
@@ -129,6 +218,7 @@ describe("human approvals", () => {
       { expectedVersion: requested.task.version },
     );
     expect(result.task.status).toBe("todo");
+    expect(result.task.progress).toBe("Stopping");
     expect(result.approval?.state).toBe("rejected");
   });
 

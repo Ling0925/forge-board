@@ -44,6 +44,270 @@ async function success(response: Response) {
 }
 
 describe("HTTP API", () => {
+  it("returns authenticated identity without requiring task scopes or exposing token data", async () => {
+    const f = httpFixture();
+    const actor = { ...f.agent, scopes: [], projectIds: [f.project.id] };
+    const token = f.tokenFor(actor);
+    expect(
+      await success(await f.request("/me", "GET", undefined, {}, token)),
+    ).toEqual(actor);
+    expect(await success(await f.request("/me"))).toEqual(f.admin);
+    expect((await f.app.request("/v1/me")).status).toBe(401);
+    f.board.revokeToken(f.admin, f.board.verifyToken(token).tokenId!);
+    expect((await f.request("/me", "GET", undefined, {}, token)).status).toBe(
+      401,
+    );
+  });
+
+  it("transitions directly to done with progress in one version and event", async () => {
+    const f = httpFixture();
+    const token = f.tokenFor(f.agent);
+    const task = f.board.claim(f.agent, f.task().id).task;
+    const before = f.repo.events(0).at(-1)!.seq;
+    const response = await f.request(
+      `/tasks/${task.id}/transition`,
+      "POST",
+      {
+        to: "done",
+        message: "Shipped",
+        progress: "Complete",
+        leaseToken: task.lease!.token,
+      },
+      {},
+      token,
+    );
+    const result = await success(response);
+    expect(result.task).toMatchObject({
+      status: "done",
+      statusMessage: "Shipped",
+      progress: "Complete",
+      version: task.version + 1,
+      lease: null,
+    });
+    expect(response.headers.get("ETag")).toBe(`"${result.task.version}"`);
+    expect(
+      f.repo
+        .events(before)
+        .filter((event) => event.taskId !== null)
+        .map((event) => event.type),
+    ).toEqual(["task_transitioned"]);
+  });
+
+  it("saves pending transition progress and preserves it on approval", async () => {
+    const f = httpFixture({ approvalRequired: ["in_progress->done"] });
+    const token = f.tokenFor(f.agent);
+    const task = f.board.claim(f.agent, f.task().id).task;
+    const leaseToken = task.lease!.token;
+    const before = f.repo.events(0).at(-1)!.seq;
+    const pending = await success(
+      await f.request(
+        `/tasks/${task.id}/transition`,
+        "POST",
+        { to: "done", message: "Shipped", progress: "Ready", leaseToken },
+        {},
+        token,
+      ),
+    );
+    expect(pending.task).toMatchObject({
+      status: "in_progress",
+      statusMessage: task.statusMessage,
+      progress: "Ready",
+      version: task.version + 1,
+    });
+    expect(
+      f.repo
+        .events(before)
+        .filter((event) => event.taskId !== null)
+        .map((event) => event.type),
+    ).toEqual(["approval_requested"]);
+    const approved = await success(
+      await f.request(
+        `/approvals/${pending.approval.id}/decide`,
+        "POST",
+        { decision: "approved" },
+        { "If-Match": String(pending.task.version) },
+      ),
+    );
+    expect(approved.task).toMatchObject({
+      status: "done",
+      statusMessage: "Shipped",
+      progress: "Ready",
+    });
+  });
+
+  it("configures agent cancellation through project create/update while retaining approval gates", async () => {
+    const f = httpFixture();
+    const token = f.tokenFor(f.agent);
+    const task = f.board.claim(f.agent, f.task().id).task;
+    const cancel = () =>
+      f.request(
+        `/tasks/${task.id}/transition`,
+        "POST",
+        { to: "canceled", leaseToken: task.lease!.token },
+        {},
+        token,
+      );
+    expect((await cancel()).status).toBe(403);
+    expect(
+      (
+        await success(
+          await f.request("/projects", "POST", {
+            key: "CANCEL",
+            name: "Cancel",
+            settings: { allowAgentCancel: true },
+          }),
+        )
+      ).settings,
+    ).toEqual({ allowAgentCancel: true });
+    for (const allowAgentCancel of [false, true]) {
+      await success(
+        await f.request(`/projects/${f.project.id}`, "PATCH", {
+          settings: { allowAgentCancel },
+        }),
+      );
+      expect((await cancel()).status).toBe(allowAgentCancel ? 200 : 403);
+    }
+    await success(
+      await f.request(`/projects/${f.project.id}`, "PATCH", {
+        settings: { allowAgentCancel: true, approvalRequired: ["*->canceled"] },
+      }),
+    );
+    const gated = f.board.claim(f.agent, f.task().id).task;
+    const pending = await success(
+      await f.request(
+        `/tasks/${gated.id}/transition`,
+        "POST",
+        { to: "canceled", leaseToken: gated.lease!.token },
+        {},
+        token,
+      ),
+    );
+    expect(pending.task.status).toBe("in_progress");
+    expect(pending.approval.state).toBe("pending");
+  });
+
+  it("adds duplicate links without changes and deletes by either selector", async () => {
+    const f = httpFixture();
+    const task = f.task();
+    const input = { kind: "thread", ref: "thread:http", title: "Original" };
+    const added = await success(
+      await f.request(`/tasks/${task.id}/links`, "POST", input, {
+        "If-Match": String(task.version),
+      }),
+    );
+    const before = f.repo.events(0).filter((event) => event.taskId !== null);
+    const duplicate = await f.request(
+      `/tasks/${task.id}/links`,
+      "POST",
+      { ...input, title: "Ignored" },
+      { "If-Match": String(added.task.version) },
+    );
+    expect(await success(duplicate)).toEqual(added);
+    expect(duplicate.headers.get("ETag")).toBe(`"${added.task.version}"`);
+    expect(f.repo.events(0).filter((event) => event.taskId !== null)).toEqual(
+      before,
+    );
+    const selector = { kind: input.kind, ref: input.ref };
+    const removed = await success(
+      await f.request(`/tasks/${task.id}/links`, "DELETE", selector, {
+        "If-Match": String(added.task.version),
+      }),
+    );
+    expect(removed.version).toBe(added.task.version + 1);
+    expect(
+      f.repo
+        .events(before.at(-1)!.seq)
+        .filter((event) => event.taskId !== null)
+        .map((event) => event.type),
+    ).toEqual(["link_removed"]);
+    const afterRemoval = f.repo
+      .events(0)
+      .filter((event) => event.taskId !== null);
+    const headers = { "If-Match": String(removed.version) };
+    const missing = await f.request(
+      `/tasks/${task.id}/links`,
+      "DELETE",
+      selector,
+      headers,
+    );
+    expect(await success(missing)).toEqual(removed);
+    expect(missing.headers.get("ETag")).toBe(`"${removed.version}"`);
+    expect(f.repo.events(0).filter((event) => event.taskId !== null)).toEqual(
+      afterRemoval,
+    );
+    expect(
+      (
+        await f.request(
+          `/tasks/${task.id}/links`,
+          "DELETE",
+          { linkId: added.link.id },
+          headers,
+        )
+      ).status,
+    ).toBe(404);
+    for (const body of [
+      {},
+      { kind: "thread" },
+      { ref: input.ref },
+      { ...selector, linkId: added.link.id },
+      { kind: "unknown", ref: input.ref },
+    ])
+      expect(
+        (await f.request(`/tasks/${task.id}/links`, "DELETE", body, headers))
+          .status,
+      ).toBe(422);
+  });
+
+  it("includes all task links and filters comma-separated statuses", async () => {
+    const f = httpFixture({}, { maxPageSize: 1 });
+    const task = f.board.createTask(f.admin, {
+      projectId: f.project.id,
+      accountable: f.owner.principal.id,
+      title: "Linked",
+      links: [
+        { kind: "thread", ref: "thread:1" },
+        { kind: "session", ref: "session:1" },
+      ],
+    });
+    f.advance(1);
+    const running = f.board.claim(f.agent, f.task().id).task;
+    const excluded = f.task();
+    f.board.transition(
+      f.admin,
+      excluded.id,
+      { to: "canceled" },
+      { expectedVersion: excluded.version },
+    );
+    const links = f.repo.list("links", "task_id = ?", [task.id]);
+    expect(await success(await f.request(`/tasks/${task.id}`))).toEqual(task);
+    expect(
+      await success(await f.request(`/tasks/${task.id}?include=links`)),
+    ).toEqual({ ...task, links });
+    const query = `/tasks?project=${f.project.id}&status=todo,in_progress&include=links&limit=1`;
+    const first = await success(await f.request(query));
+    expect(first.items).toEqual([{ ...task, links }]);
+    const second = await success(
+      await f.request(
+        `${query}&cursor=${encodeURIComponent(first.nextCursor)}`,
+      ),
+    );
+    expect(second).toEqual({
+      items: [{ ...running, links: [] }],
+      nextCursor: null,
+    });
+    expect(
+      (await success(await f.request("/tasks?status=in_progress"))).items,
+    ).toEqual([running]);
+    for (const path of [
+      "/tasks?status=todo,unknown",
+      "/tasks?status=",
+      "/tasks?status=todo,",
+      "/tasks?include=unknown",
+      `/tasks/${task.id}?include=unknown`,
+    ])
+      expect((await f.request(path)).status).toBe(422);
+  });
+
   it.each([undefined, 1])(
     "accepts omitted limits on every list with maxPageSize %s",
     async (maxPageSize) => {

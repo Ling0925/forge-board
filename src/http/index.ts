@@ -5,6 +5,7 @@ import {
   BoardError,
   type Mutation,
   type Task,
+  actorSchema,
   approvalDecisionSchema,
   approvalQuerySchema,
   approvalSchema,
@@ -25,7 +26,11 @@ import {
   principalInputSchema,
   principalSchema,
   projectSchema,
+  removeLinkSchema,
+  statusSchema,
   taskQuerySchema,
+  taskReadOptionsSchema,
+  taskReadSchema,
   taskSchema,
   tokenInputSchema,
   tokenSchema,
@@ -134,7 +139,7 @@ export function createApp(board: ReturnType<typeof createBoard>) {
       ),
     );
   }
-  function mutate<B extends z.ZodObject | z.ZodDiscriminatedUnion>(
+  function mutate<B extends z.ZodObject | z.ZodUnion>(
     method: "post" | "patch" | "delete",
     path: string,
     body: B,
@@ -201,6 +206,8 @@ export function createApp(board: ReturnType<typeof createBoard>) {
     });
   }
 
+  get("/v1/me", empty, actorSchema.omit({ tokenId: true }), (a) => board.me(a));
+
   get("/v1/projects", pageQuery, pageOf(projectSchema), (a, q) =>
     board.listProjects(a, q),
   );
@@ -235,12 +242,18 @@ export function createApp(board: ReturnType<typeof createBoard>) {
   const tasksQuery = taskQuerySchema.omit({ projectId: true }).extend({
     ...pageQuery.shape,
     project: taskQuerySchema.shape.projectId,
+    status: z
+      .string()
+      .describe("Comma-separated task statuses")
+      .transform((value) => value.split(","))
+      .pipe(z.array(statusSchema))
+      .optional(),
     ready: z.enum(["true", "false"]).optional(),
   });
   get(
     "/v1/tasks",
     tasksQuery,
-    pageOf(taskSchema),
+    pageOf(taskReadSchema),
     (a, { project, ready, ...q }) =>
       board.listTasks(a, {
         ...q,
@@ -258,9 +271,9 @@ export function createApp(board: ReturnType<typeof createBoard>) {
   );
   get(
     "/v1/tasks/:id",
-    empty,
-    taskSchema,
-    (a, _, id) => board.getTask(a, id),
+    taskReadOptionsSchema,
+    taskReadSchema,
+    (a, q, id) => board.getTask(a, id, q),
     true,
   );
   mutate(
@@ -319,9 +332,9 @@ export function createApp(board: ReturnType<typeof createBoard>) {
   mutate(
     "delete",
     "/v1/tasks/:id/links",
-    z.strictObject({ linkId: linkSchema.shape.id }),
+    removeLinkSchema,
     taskSchema,
-    (a, b, m, id) => board.removeLink(a, id, b.linkId, m),
+    (a, b, m, id) => board.removeLink(a, id, b, m),
     true,
   );
   get(

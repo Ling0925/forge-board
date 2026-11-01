@@ -93,12 +93,15 @@ todo ─claim─▶ in_progress ─▶ in_review ─(批准)─▶ done
   │              │  │  └─▶ input_required ─(回答)─┘
   │              │  └──── blocked（依赖未完成或外部阻塞）
   └─release/租约过期┘
-任意非终态 ─▶ canceled（人或负责人）     in_progress ─▶ failed
+in_progress ─▶ done（默认可直接完成，仍受项目审批规则约束）
+任意非终态 ─▶ canceled（默认由人执行；allowAgentCancel 可允许 agent）
+in_progress ─▶ failed
 终态：done / failed / canceled；“重开”就是回到 todo，并记录一条事件
 ```
 
 - `ready` 不是一个状态，而是一个**查询**：`status=todo`、依赖全部是 `done`、并且没有有效租约。
 - 项目可以配置“哪些转换需要审批”，例如 `in_review→done` 必须由人批准。
+- 转换输入可同时携带 `progress`，与状态、statusMessage 在一次版本递增和一条事件中保存。需要审批时，progress 与 `approval_requested` 同次保存，状态和 message 等待审批。
 
 ---
 
@@ -125,6 +128,7 @@ todo ─claim─▶ in_progress ─▶ in_review ─(批准)─▶ done
   - agent **不能**批准审批，也不能当 `accountable`；
   - agent 只能把任务指派给自己，或指派给同一个归属人名下、并且自己有 `tasks:assign` 的 agent。是否允许“agent 指派给别的 agent”是一个项目设置，默认关闭；
   - 项目可以要求某些转换（例如完成、取消）或某些外部动作必须经过人批准；
+  - 项目设置 `allowAgentCancel` 省略或为 false 时，取消仍由人执行，agent 可按原规则请求由人批准的取消；为 true 时，agent 可在相同写入权限、版本及租约检查下取消任务，审批门禁不变；
   - 每个事件都记录 actor，agent 的事件还附上它的归属人。
 
 ---
@@ -135,12 +139,13 @@ todo ─claim─▶ in_progress ─▶ in_review ─(批准)─▶ done
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| GET | `/me` | 当前认证身份的 principal、scopes、projectIds，不含 token 信息 |
 | GET/POST | `/projects`，`/projects/{id}` | 项目 |
-| GET | `/tasks?project=&status=&assignee=&label=&link=&ready=true&cursor=` | 列表和查询（`link=gh:owner/repo#12` 按 Thread 查） |
+| GET | `/tasks?project=&status=&assignee=&label=&link=&ready=true&cursor=&include=links` | 列表和查询；status 可用逗号分隔多个状态，未知值为校验错误；include 可选 |
 | POST | `/tasks` | 创建，支持 Idempotency-Key |
-| GET/PATCH | `/tasks/{id}` | 读取；更新时用 If-Match |
+| GET/PATCH | `/tasks/{id}` | 读取可选 `include=links`；更新时用 If-Match |
 | POST | `/tasks/{id}/claim` · `/claim-next` · `/lease/renew` · `/release` | 认领、租约 |
-| POST | `/tasks/{id}/transition` `{to, message}` | 状态转换，服务端校验 |
+| POST | `/tasks/{id}/transition` `{to, message?, progress?}` | 状态与进度原子转换，服务端校验 |
 | POST/DELETE | `/tasks/{id}/links`，`/dependencies`，`/labels` | 关联 |
 | POST/GET | `/tasks/{id}/comments`，`/artifacts` | 评论、产物 |
 | POST | `/approvals/{id}/decide` | 人审批 |
@@ -149,12 +154,15 @@ todo ─claim─▶ in_progress ─▶ in_review ─(批准)─▶ done
 
 所有列表用游标分页，**不设固定的 page 上限**，`limit` 由调用方给（服务端可以有一个设置化的最大值，理由是防止一次响应占用过多内存）。
 
+任务读取和列表的 `include=links` 在每个任务中返回全部关联的 `links` 数组，不分页；省略时响应不变。添加已有 `(kind, ref)` 返回原 link 和未变更任务，不更新 title。删除 link 的请求体为 `{linkId}` 或 `{kind, ref}`；按 `(kind, ref)` 删除不存在的关联返回未变更任务，按未知 linkId 删除仍报错。这两种无变更操作不递增任务版本、不产生任务事件，仍检查权限、版本及租约。
+
 ### 6.2 MCP 工具（工具少而粗，借鉴 TodoWrite 的“小接口”）
 
-- `board_list`（含 `ready`）、`board_get`
+- `board_me`（当前 principal、scopes、projectIds）
+- `board_list`（含 `ready`，status 支持单值或数组）、`board_get`；两者均可用 `include:"links"` 内嵌完整关联
 - `board_create`（支持一次建多个子任务）、`board_update`
-- `board_claim`（可以指定 id，也可以 `next: true`）、`board_release`、`board_transition`
-- `board_comment`（`question` 类型会把任务置为 `input_required`）、`board_artifact`、`board_link`
+- `board_claim`（可以指定 id，也可以 `next: true`）、`board_release`、`board_transition`（可带 progress）
+- `board_comment`（`question` 类型会把任务置为 `input_required`）、`board_artifact`、`board_link`、`board_unlink`（linkId 或 kind + ref）
 
 MCP 资源可以作为可选项：`board://task/{id}`。服务是无状态的 Streamable HTTP，用 Bearer token 认证，与 zzboard 的做法一致。
 
@@ -164,10 +172,10 @@ MCP 资源可以作为可选项：`board://task/{id}`。服务是无状态的 St
 |---|---|
 | `create({title, brief, threadIds, profileId})` | `POST /tasks`：`description=brief`、`links=[{kind:"thread"}…]`、`metadata.forge.profileId`，`Idempotency-Key` 由 Forge 生成 |
 | `claim(id, claimedBy)` | `POST /tasks/{id}/claim`，适配器保存 lease token，Worker 每次写入都会顺带续租 |
-| `update(id, {status, progress})` | 转换状态加更新 `progress`，按下面的映射 |
-| `linkThread` / `unlinkThread` | `POST/DELETE /tasks/{id}/links`（kind=`thread`） |
+| `update(id, {status, progress})` | `POST /tasks/{id}/transition` 同时传 to、progress；只有进度变更时用 PATCH，状态按下面的映射 |
+| `linkThread` / `unlinkThread` | `POST/DELETE /tasks/{id}/links`（kind=`thread`、ref=Thread 引用），重复添加或删除缺失关联不修改任务 |
 | `linkWorker(id, sessionId, worktree)` | link kind=`session`，ref=`forge:session:<id>`；`metadata.forge.worktree` |
-| `get` / `list({status, threadId})` | `GET /tasks/{id}` / `GET /tasks?status=&link=` |
+| `get` / `list({status, threadId})` | `GET /tasks/{id}?include=links` / `GET /tasks?status=&link=&include=links`；status 支持多个值 |
 
 状态映射（Forge → 平台）：
 - `queued` → `todo`
@@ -186,6 +194,7 @@ MCP 资源可以作为可选项：`board://task/{id}`。服务是无状态的 St
 ## 7. 技术栈与部署
 
 - **语言和工具链**：TypeScript ESM、Node 22、pnpm、Vitest、Biome、esbuild，与 forge-core 一致。
+- **git 依赖安装**：package.json 的 `prepare` 执行 `node scripts/build.mjs`，从干净源码安装时生成 `dist/`。
 - **HTTP 框架**：推荐 **Hono**。它很轻，对 SSE 支持好，也能跑在 Node 上；也可以直接用 `node:http`，但路由和中间件要自己写。
 - **MCP**：官方 `@modelcontextprotocol/sdk` 的 Streamable HTTP 服务端。
 - **校验**：zod，同一份 schema 同时生成 REST 的 OpenAPI 和 MCP 的 inputSchema。
