@@ -5,6 +5,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type RequestId,
+  isJSONRPCErrorResponse,
+  isJSONRPCRequest,
+  isJSONRPCResultResponse,
 } from "@modelcontextprotocol/sdk/types.js";
 import { name, version } from "../../package.json";
 
@@ -22,9 +26,34 @@ export async function startProxy(url: string, token: string) {
   server.setRequestHandler(CallToolRequestSchema, (request, extra) =>
     upstream.callTool(request.params, undefined, { signal: extra.signal }),
   );
-  await server.connect(new StdioServerTransport());
-  process.stdin.once("end", () => {
-    void server.close();
-    void upstream.close();
+  const transport = new StdioServerTransport();
+  const pending = new Set<RequestId>();
+  let inputEnded = false;
+  const drained = new Promise<void>((resolve) => {
+    const finish = () => {
+      if (inputEnded && pending.size === 0) resolve();
+    };
+    transport.onmessage = (message) => {
+      if (isJSONRPCRequest(message)) pending.add(message.id);
+    };
+    const send = transport.send.bind(transport);
+    transport.send = async (message) => {
+      await send(message);
+      if (
+        (isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) &&
+        message.id !== undefined
+      ) {
+        pending.delete(message.id);
+        finish();
+      }
+    };
+    process.stdin.once("end", () => {
+      inputEnded = true;
+      finish();
+    });
   });
+  await server.connect(transport);
+  await drained;
+  await server.close();
+  await upstream.close();
 }

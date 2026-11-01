@@ -232,7 +232,7 @@ export const mutationSchema = z.strictObject({
 export type Mutation = z.infer<typeof mutationSchema>;
 export const pageSchema = z.strictObject({
   cursor: z.string().optional(),
-  limit: z.number().int().positive(),
+  limit: z.number().int().positive().optional(),
 });
 export type PageInput = z.infer<typeof pageSchema>;
 export type Page<T> = { items: T[]; nextCursor: string | null };

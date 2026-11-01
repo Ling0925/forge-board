@@ -21,6 +21,46 @@ function nextPage(html: string, cursor: string) {
 }
 
 describe("read-only web pages", () => {
+  it("shows project names, task titles, and related lists without query parameters after login", async () => {
+    const f = webFixture();
+    const first = f.task("First smoke task");
+    const second = f.task("Second smoke task");
+    const comment = f.board.addComment(
+      f.admin,
+      first.id,
+      {
+        kind: "comment",
+        body: "Smoke comment",
+      },
+      { expectedVersion: first.version },
+    ).comment;
+    const logged = await f.app.request("/ui/login", {
+      method: "POST",
+      body: new URLSearchParams({ token: f.token.secret! }),
+    });
+    expect(logged.status).toBe(303);
+    const headers = {
+      Cookie: logged.headers.get("Set-Cookie")!.split(";")[0]!,
+    };
+    for (const path of ["/", `/?project=${f.project.id}`, "/?limit="]) {
+      const response = await f.app.request(path, { headers });
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      expect(html).toContain(f.project.name);
+      expect(html).toContain(first.title);
+      expect(html).toContain(second.title);
+      expect(html).not.toContain("limit=undefined");
+      expect(html).toContain('name="limit" min="1" value=""');
+    }
+    const response = await f.app.request(`/tasks/${first.id}`, { headers });
+    expect(response.status).toBe(200);
+    const detail = await response.text();
+    expect(detail).toContain(comment.body);
+    for (const section of ["依赖", "关联", "产物", "评论", "审批", "活动"])
+      expect(detail).toContain(`<h2>${section}</h2>`);
+    expect(detail).not.toContain("limit=undefined");
+  });
+
   it("uses POST login with an HttpOnly session cookie, never query tokens, and keeps API writes Bearer-only", async () => {
     const f = webFixture();
     const login = await f.app.request("/ui/login");
@@ -153,9 +193,7 @@ describe("read-only web pages", () => {
     const root = await (await get("/")).text();
     expect(root).toContain(escaped);
     expect(root).not.toContain(attack);
-    const board = await (
-      await get(`/?project=${f.project.id}&limit=10`)
-    ).text();
+    const board = await (await get(`/?project=${f.project.id}`)).text();
     expect(board).toContain("in_review");
     expect(board).toContain("Dependency");
     const boardNext = await (await get(nextPage(board, "tasksCursor"))).text();
@@ -192,12 +230,10 @@ describe("read-only web pages", () => {
     expect(nextPage(detail, "eventsCursor")).toBeDefined();
   });
 
-  it("requests a page size when unset and respects read scopes and project visibility", async () => {
+  it("allows an empty page size and respects read scopes and project visibility", async () => {
     const f = webFixture();
     const root = await f.app.request("/", { headers: f.headers });
-    expect(await root.text()).toContain(
-      'name="limit" min="1" required value=""',
-    );
+    expect(await root.text()).toContain('name="limit" min="1" value=""');
     const privateProject = f.board.createProject(f.admin, {
       key: "PRIVATE",
       name: "Secret project",
@@ -213,9 +249,9 @@ describe("read-only web pages", () => {
       projectIds: [f.project.id],
     }).secret!;
     const headers = { Authorization: `Bearer ${secret}` };
-    expect(
-      await (await f.app.request("/?limit=10", { headers })).text(),
-    ).not.toContain("Secret project");
+    expect(await (await f.app.request("/", { headers })).text()).not.toContain(
+      "Secret project",
+    );
     expect(
       (
         await f.app.request(`/?project=${privateProject.id}&limit=10`, {

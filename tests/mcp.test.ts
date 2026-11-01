@@ -5,6 +5,61 @@ import { fixture } from "./helpers.js";
 import { call, connectMcp, serveBoard, toolData } from "./transport-helpers.js";
 
 describe("MCP Streamable HTTP", () => {
+  it.each([undefined, 1])(
+    "accepts omitted list and related collection limits with maxPageSize %s",
+    async (maxPageSize) => {
+      const f = fixture({}, { maxPageSize });
+      const first = f.task("First");
+      f.task("Second");
+      const token = f.board.createToken(f.admin, {
+        principalId: f.owner.principal.id,
+        scopes: ["tasks:read"],
+      }).secret!;
+      const server = await serveBoard(f.board);
+      const client = await connectMcp(server.url, token);
+      try {
+        const tool = (await client.listTools()).tools.find(
+          (tool) => tool.name === "board_list",
+        )!;
+        expect(tool.inputSchema.required ?? []).not.toContain("limit");
+        const page = await call(client, "board_list", {});
+        expect(page.items).toHaveLength(maxPageSize ?? 2);
+        expect(page).toEqual(await call(client, "board_list", { limit: 2 }));
+        const detail = await call(client, "board_get", {
+          id: first.id,
+          comments: {},
+          artifacts: {},
+          links: {},
+          dependencies: {},
+          approvals: {},
+          events: {},
+        });
+        for (const collection of [
+          "comments",
+          "artifacts",
+          "links",
+          "dependencies",
+          "approvals",
+        ])
+          expect(detail[collection]).toEqual({ items: [], nextCursor: null });
+        expect(detail.events.items).toHaveLength(1);
+        if (maxPageSize !== undefined) {
+          const last = await call(client, "board_list", {
+            cursor: page.nextCursor,
+          });
+          expect(last.items).toHaveLength(1);
+          expect(last.items[0].id).not.toBe(page.items[0].id);
+          expect(last.nextCursor).toBeNull();
+        } else {
+          expect(page.nextCursor).toBeNull();
+        }
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    },
+  );
+
   it("advertises zod schemas and preserves service validation, idempotency, versions, claims and related pages", async () => {
     const f = fixture({}, { maxPageSize: 1 });
     const token = f.board.createToken(f.admin, {

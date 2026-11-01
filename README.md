@@ -66,7 +66,7 @@ REST 位于 `/v1`，使用 `Authorization: Bearer <token>`。完整接口与 sch
 | `GET /v1/approvals`、`POST /v1/approvals/:id/decide` | 查询审批、人类决策 |
 | `GET /v1/events` | 事件分页，或 SSE 订阅 |
 
-列表必须传 `limit`，响应为 `{items, nextCursor}`；用 `cursor=nextCursor` 继续。任务可按 `project`、`status`、`assignee`、`label`、`link`、`parentId`、`ready=true` 过滤。`ready` 表示 todo、依赖全部完成且没有有效租约。
+REST、MCP、CLI 和网页的列表均可省略 `limit`（CLI 为 `--limit`）：配置了 `maxPageSize` 时使用该值，否则返回全部结果；显式传入的 `limit` 仍受 `maxPageSize` 限制。响应为 `{items, nextCursor}`；用 `cursor=nextCursor` 继续。任务可按 `project`、`status`、`assignee`、`label`、`link`、`parentId`、`ready=true` 过滤。`ready` 表示 todo、依赖全部完成且没有有效租约。
 
 创建时可附带 `links` 和 `subtasks`，与父任务在同一事务内写入；返回父任务，子任务通过 `parentId` 查询。子任务继承项目和默认负责人，可单独指定人类 `accountable`。
 
@@ -95,8 +95,8 @@ SSE 的 `id` 是全局递增事件序号；用 `Last-Event-ID` 或 `after` 续�
 
 | 工具 | 参数要点 |
 | --- | --- |
-| `board_list` | `limit`、`cursor`、`projectId`、`ready`、`status`、`link` 等过滤项 |
-| `board_get` | `id`；可选 `comments`、`artifacts`、`links`、`dependencies`、`approvals`、`events`，各传 `{limit, cursor?}` |
+| `board_list` | 可选 `limit`、`cursor`、`projectId`、`ready`、`status`、`link` 等过滤项 |
+| `board_get` | `id`；可选 `comments`、`artifacts`、`links`、`dependencies`、`approvals`、`events`，各传 `{limit?, cursor?}`（可用 `{}`） |
 | `board_create` | `projectId`、`title`、`accountable`，可选 `links`、`subtasks` 等 |
 | `board_update` | `id` 和待更新字段，`expectedVersion` |
 | `board_claim` | `{id}` 或 `{next:true, projectId}`；没有 ready 任务返回 null |
@@ -139,13 +139,13 @@ SSE 的 `id` 是全局递增事件序号；用 `Last-Event-ID` 或 `after` 续�
 }
 ```
 
-也可运行 `forge-board mcp --url <server> --token <token>`，命令行参数优先于环境变量。stdout 只输出 MCP 协议。
+也可运行 `forge-board mcp --url <server> --token <token>`，命令行参数优先于环境变量。stdout 只输出 MCP 协议；stdin 结束后，代理等待已接收请求的响应发送完毕再关闭连接。
 
 ## 网页与人工审批
 
 浏览器访问 `/`，在 `/ui/login` 的表单中提交 token。登录使用 POST 设置 HttpOnly、SameSite=Strict 的会话 cookie，HTTPS 下带 Secure；TLS 反向代理应覆盖设置 `X-Forwarded-Proto: https`。token 不放 URL，避免进入 URL 日志、历史记录或 Referer；页面使用 `Cache-Control: no-store` 和 `Referrer-Policy: no-referrer`。Cookie 仅用于网页认证，REST/MCP 始终要求 Bearer。
 
-填写每页条数后选择项目，按状态列查看任务；配置了 `maxPageSize` 时用该值初始化表单。任务详情 `/tasks/:id` 展示字段、依赖、关联、产物、评论、审批及事件活动，各列表独立翻页。页面直接服务端渲染，用户内容全部转义，引用和产物 URI 作为文本展示。没有任务写入操作，手动刷新查看最新状态。
+登录后直接显示可见项目和按状态分列的任务，无需查询参数；选择项目可筛选任务。每页条数可留空：配置了 `maxPageSize` 时使用该值，否则显示全部结果。任务详情 `/tasks/:id` 无需查询参数即可展示字段、依赖、关联、产物、评论、审批及事件活动，各列表独立翻页。页面直接服务端渲染，用户内容全部转义，引用和产物 URI 作为文本展示。没有任务写入操作，手动刷新查看最新状态。
 
 审批只能由有 `tasks:approve` 的人通过 REST 或 CLI 完成：
 

@@ -42,7 +42,7 @@ import { createOpenApi, mutationHeadersSchema } from "./openapi.js";
 type Env = { Variables: { actor: Actor } };
 const empty = z.strictObject({});
 const pageQuery = pageSchema.extend({
-  limit: z.coerce.number().int().positive(),
+  limit: z.coerce.number().int().positive().optional(),
 });
 const pageOf = <S extends z.ZodType>(schema: S) =>
   z.strictObject({ items: z.array(schema), nextCursor: z.string().nullable() });
@@ -452,9 +452,9 @@ export function createApp(board: ReturnType<typeof createBoard>) {
 
   openapi.add("get", "/v1/events", {
     query: eventQuery.extend({
-      limit: pageQuery.shape.limit
-        .optional()
-        .describe("Required for JSON pages; omitted for SSE"),
+      limit: pageQuery.shape.limit.describe(
+        "Optional for JSON pages; omitted for SSE",
+      ),
     }),
     response: pageOf(eventSchema),
     events: true,

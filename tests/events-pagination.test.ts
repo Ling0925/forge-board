@@ -144,6 +144,35 @@ describe("events, cursor pagination, and configuration", () => {
     ).toHaveLength(2);
   });
 
+  it.each([undefined, 2])(
+    "uses maxPageSize %s when limit is omitted and resumes from cursors",
+    (maxPageSize) => {
+      const { board, admin, task } = fixture({}, { maxPageSize });
+      for (const title of ["First", "Second", "Third"]) task(title);
+      const first = board.listTasks(admin, {});
+      expect(first.items).toHaveLength(maxPageSize ?? 3);
+      expect(board.listTasks(admin, { limit: 3 })).toEqual(first);
+      const limited = board.listTasks(admin, { limit: 1 });
+      expect(limited.items).toEqual(first.items.slice(0, 1));
+      const remaining = board.listTasks(admin, { cursor: limited.nextCursor! });
+      expect(remaining.items).toHaveLength(2);
+      expect(remaining.nextCursor).toBeNull();
+      if (maxPageSize === undefined) {
+        expect(first.nextCursor).toBeNull();
+        expect([...limited.items, ...remaining.items]).toEqual(first.items);
+      } else {
+        expect(first.nextCursor).not.toBeNull();
+        const last = board.listTasks(admin, { cursor: first.nextCursor! });
+        expect(last.items).toEqual(remaining.items.slice(1));
+        expect(last.nextCursor).toBeNull();
+      }
+      expect(board.listTasks(admin, { status: "done" })).toEqual({
+        items: [],
+        nextCursor: null,
+      });
+    },
+  );
+
   it("validates config before opening the database", () => {
     const directory = temporaryDirectory();
     writeFileSync(

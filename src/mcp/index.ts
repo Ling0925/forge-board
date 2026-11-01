@@ -83,13 +83,13 @@ export async function mcpResponse(
 
   tool(
     "board_list",
-    "List tasks, including the dependency-aware ready queue. Supply limit; continue with nextCursor.",
+    "List tasks, including the dependency-aware ready queue. Optional limit defaults to maxPageSize if configured, otherwise all results; continue with nextCursor.",
     taskQuerySchema,
     (input) => board.listTasks(actor, input),
   );
   tool(
     "board_get",
-    "Get a task. Request related collections with {limit, cursor?}; each returns its own nextCursor.",
+    "Get a task. Request related collections with {limit?, cursor?}; each returns its own nextCursor.",
     id.extend({
       dependencies: pageSchema.optional(),
       links: pageSchema.optional(),

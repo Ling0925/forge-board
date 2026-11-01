@@ -336,7 +336,7 @@ export function createBoard(options: BoardOptions) {
     const limit =
       settings.maxPageSize === undefined
         ? page.limit
-        : Math.min(page.limit, settings.maxPageSize);
+        : Math.min(page.limit ?? settings.maxPageSize, settings.maxPageSize);
     const cursor = page.cursor;
     const remaining =
       cursor === undefined
@@ -347,7 +347,9 @@ export function createBoard(options: BoardOptions) {
     return {
       items: selected,
       nextCursor:
-        limit < remaining.length && last !== undefined ? key(last) : null,
+        selected.length < remaining.length && last !== undefined
+          ? key(last)
+          : null,
     };
   }
 

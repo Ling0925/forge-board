@@ -20,15 +20,15 @@ const usage = `forge-board <command> --data <dir>
   serve [--host <host>] [--port <port>] (port may be set in config.json)
   mcp --url <server> --token <token> (or FORGE_BOARD_URL/FORGE_BOARD_TOKEN; no --data)
   principal create --kind human|agent --name <name> [--owner <human id>]
-  principal list --limit <n> [--cursor <cursor>]
+  principal list [--limit <n>] [--cursor <cursor>]
   principal disable <id>
   token create --principal <id> --scopes <comma-separated scopes> [--projects <comma-separated ids>] [--expires-at <ISO timestamp>]
-  token list --limit <n> [--cursor <cursor>]
+  token list [--limit <n>] [--cursor <cursor>]
   token revoke <id>
   project create --key <key> --name <name> [--settings <JSON>]
-  project list --limit <n> [--cursor <cursor>]
+  project list [--limit <n>] [--cursor <cursor>]
   project settings <id> --settings <JSON>
-  approvals list --limit <n> [--project <id>] [--task <id>] [--state pending|approved|rejected] [--cursor <cursor>]
+  approvals list [--limit <n>] [--project <id>] [--task <id>] [--state pending|approved|rejected] [--cursor <cursor>]
   approvals approve|reject <id> --expected-version <task version> [--lease-token <token>]
 Administration commands require --token <Bearer token> and accept --idempotency-key <key>.`;
 
@@ -119,7 +119,7 @@ async function main() {
     });
     const page = () =>
       pageSchema.parse({
-        limit: Number(required(values.limit, "--limit")),
+        limit: values.limit === undefined ? undefined : Number(values.limit),
         cursor: values.cursor,
       });
     const entityId = () => required(id, "Entity id");

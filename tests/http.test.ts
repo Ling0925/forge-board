@@ -5,8 +5,11 @@ import { type Actor, taskSchema } from "../src/domain/index.js";
 import { createApp } from "../src/http/index.js";
 import { fixture } from "./helpers.js";
 
-function httpFixture(settings: Parameters<typeof fixture>[0] = {}) {
-  const f = fixture(settings);
+function httpFixture(
+  settings: Parameters<typeof fixture>[0] = {},
+  globalSettings?: Parameters<typeof fixture>[1],
+) {
+  const f = fixture(settings, globalSettings);
   const app = createApp(f.board);
   const tokenFor = (actor: Actor) =>
     f.board.createToken(f.admin, {
@@ -41,6 +44,46 @@ async function success(response: Response) {
 }
 
 describe("HTTP API", () => {
+  it.each([undefined, 1])(
+    "accepts omitted limits on every list with maxPageSize %s",
+    async (maxPageSize) => {
+      const f = httpFixture({}, { maxPageSize });
+      const task = f.task("First");
+      f.task("Second");
+      for (const path of [
+        "/projects",
+        `/projects/${f.project.id}/labels`,
+        "/tasks",
+        ...["comments", "artifacts", "links", "dependencies", "approvals"].map(
+          (collection) => `/tasks/${task.id}/${collection}`,
+        ),
+        "/approvals",
+        "/principals",
+        "/tokens",
+      ]) {
+        expect(await success(await f.request(path))).toEqual(
+          await success(await f.request(`${path}?limit=100`)),
+        );
+      }
+      const events = await success(await f.request("/events"));
+      expect(events).toEqual(f.board.listEvents(f.admin, {}));
+      const page = await success(await f.request("/tasks"));
+      expect(page.items).toHaveLength(maxPageSize ?? 2);
+      if (maxPageSize !== undefined) {
+        const last = await success(
+          await f.request(
+            `/tasks?cursor=${encodeURIComponent(page.nextCursor)}`,
+          ),
+        );
+        expect(last.items).toHaveLength(1);
+        expect(last.items[0].id).not.toBe(page.items[0].id);
+        expect(last.nextCursor).toBeNull();
+      } else {
+        expect(page.nextCursor).toBeNull();
+      }
+    },
+  );
+
   it("maps authentication, scopes, project scopes, validation, and missing resources", async () => {
     const f = httpFixture();
     const missing = await f.app.request("/v1/tasks?limit=1");
@@ -77,7 +120,6 @@ describe("HTTP API", () => {
       ),
     ).toEqual({ items: [], nextCursor: null });
     for (const path of [
-      "/tasks",
       "/tasks?limit=no",
       "/tasks?limit=0",
       "/tasks?limit=1&ready=maybe",
