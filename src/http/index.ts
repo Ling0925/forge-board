@@ -33,7 +33,9 @@ import {
   updateProjectSchema,
   updateTaskSchema,
 } from "../domain/index.js";
+import { mcpResponse } from "../mcp/index.js";
 import type { createBoard } from "../service/index.js";
+import { createWebApp } from "../web/index.js";
 import { eventStream } from "./events.js";
 import { createOpenApi, mutationHeadersSchema } from "./openapi.js";
 
@@ -97,12 +99,19 @@ export function createApp(board: ReturnType<typeof createBoard>) {
     public: true,
   });
   app.get("/v1/openapi.json", (c) => c.json(openapi.document));
-  app.use("/v1/*", async (c, next) => {
+  const authenticate = async (c: Context<Env>, next: () => Promise<void>) => {
     const match = /^Bearer\s+(\S+)$/i.exec(c.req.header("Authorization") ?? "");
     if (!match?.[1])
       throw new BoardError("unauthorized", "A Bearer token is required");
     c.set("actor", board.verifyToken(match[1]));
     await next();
+  };
+  app.use("/v1/*", authenticate);
+  app.use("/mcp", authenticate);
+  app.post("/mcp", (c) => mcpResponse(board, c.get("actor"), c.req.raw));
+  app.all("/mcp", (c) => {
+    c.header("Allow", "POST");
+    return c.body(null, 405);
   });
 
   function get<Q extends z.ZodObject>(
@@ -478,5 +487,6 @@ export function createApp(board: ReturnType<typeof createBoard>) {
       }),
     );
   });
+  app.route("/", createWebApp(board));
   return app;
 }

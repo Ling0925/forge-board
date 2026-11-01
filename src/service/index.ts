@@ -637,6 +637,62 @@ export function createBoard(options: BoardOptions) {
     return { token: metadata, secret: secret as string | null };
   }
 
+  function insertTask(actor: Actor, data: Omit<CreateTask, "subtasks">): Task {
+    projectSettings(data.projectId);
+    human(data.accountable);
+    if (data.assignee !== undefined && data.assignee !== null)
+      assignment(actor, data.projectId, data.assignee);
+    validateParent(actor, null, data.parentId ?? null);
+    validateLabels(data.projectId, data.labels ?? []);
+    const result = repo.insert("tasks", {
+      id: id("tsk"),
+      workspaceId,
+      projectId: data.projectId,
+      number: repo.nextTaskNumber(data.projectId),
+      title: data.title,
+      description: data.description ?? "",
+      status: "todo",
+      statusMessage: "",
+      accountable: data.accountable,
+      assignee: data.assignee ?? null,
+      lease: null,
+      parentId: data.parentId ?? null,
+      priority: data.priority ?? 0,
+      labels: [...new Set(data.labels ?? [])].sort(),
+      authorization: data.authorization ?? null,
+      progress: "",
+      metadata: data.metadata ?? {},
+      version: 1,
+      createdBy: actor.principal.id,
+      createdAt: at(),
+      updatedAt: at(),
+    });
+    record(actor, "task_created", { taskId: result.id }, result);
+    for (const input of data.links ?? []) {
+      const link = insertLink(result.id, input);
+      record(actor, "link_added", { linkId: link.id }, result);
+    }
+    return result;
+  }
+
+  function insertLink(taskId: string, data: z.infer<typeof linkInputSchema>) {
+    if (
+      repo.list("links", "task_id = ? AND kind = ? AND ref = ?", [
+        taskId,
+        data.kind,
+        data.ref,
+      ]).length
+    )
+      throw new BoardError("conflict", "Link already exists");
+    return repo.insert("links", {
+      ...data,
+      title: data.title ?? null,
+      id: id("lnk"),
+      workspaceId,
+      taskId,
+    });
+  }
+
   return {
     settings,
 
@@ -952,37 +1008,15 @@ export function createBoard(options: BoardOptions) {
         data,
         mutation,
         (actor) => {
-          projectSettings(data.projectId);
-          human(data.accountable);
-          if (data.assignee !== undefined && data.assignee !== null)
-            assignment(actor, data.projectId, data.assignee);
-          validateParent(actor, null, data.parentId ?? null);
-          validateLabels(data.projectId, data.labels ?? []);
-          const result = repo.insert("tasks", {
-            id: id("tsk"),
-            workspaceId,
-            projectId: data.projectId,
-            number: repo.nextTaskNumber(data.projectId),
-            title: data.title,
-            description: data.description ?? "",
-            status: "todo",
-            statusMessage: "",
-            accountable: data.accountable,
-            assignee: data.assignee ?? null,
-            lease: null,
-            parentId: data.parentId ?? null,
-            priority: data.priority ?? 0,
-            labels: [...new Set(data.labels ?? [])].sort(),
-            authorization: data.authorization ?? null,
-            progress: "",
-            metadata: data.metadata ?? {},
-            version: 1,
-            createdBy: actor.principal.id,
-            createdAt: at(),
-            updatedAt: at(),
-          });
-          record(actor, "task_created", { taskId: result.id }, result);
-          return result;
+          const parent = insertTask(actor, data);
+          for (const child of data.subtasks ?? [])
+            insertTask(actor, {
+              ...child,
+              projectId: parent.projectId,
+              parentId: parent.id,
+              accountable: child.accountable ?? parent.accountable,
+            });
+          return parent;
         },
         { access: (actor) => authorize(actor, "tasks:write", data.projectId) },
       );
@@ -1385,21 +1419,7 @@ export function createBoard(options: BoardOptions) {
         (actor, mutation) => {
           const task = taskFor(actor, taskId, "tasks:write");
           checkWrite(actor, task, mutation);
-          if (
-            repo.list("links", "task_id = ? AND kind = ? AND ref = ?", [
-              taskId,
-              data.kind,
-              data.ref,
-            ]).length
-          )
-            throw new BoardError("conflict", "Link already exists");
-          const link = repo.insert("links", {
-            ...data,
-            title: data.title ?? null,
-            id: id("lnk"),
-            workspaceId,
-            taskId,
-          });
+          const link = insertLink(taskId, data);
           return {
             link,
             task: saveTask(actor, task, "link_added", { linkId: link.id }),

@@ -2,9 +2,9 @@ import { once } from "node:events";
 import type { Server } from "node:http";
 import { serve } from "@hono/node-server";
 import { describe, expect, it, vi } from "vitest";
-import type { Event } from "../src/domain/index.js";
 import { createApp } from "../src/http/index.js";
 import { fixture } from "./helpers.js";
+import { subscribe } from "./transport-helpers.js";
 
 async function withServer(
   run: (
@@ -37,52 +37,6 @@ async function withServer(
     server.closeAllConnections();
     await closed;
   }
-}
-
-async function subscribe(
-  url: string,
-  secret: string,
-  headers: Record<string, string> = {},
-) {
-  const controller = new AbortController();
-  const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${secret}`,
-      Accept: "text/event-stream",
-      ...headers,
-    },
-    signal: controller.signal,
-  });
-  expect(response.status).toBe(200);
-  expect(response.headers.get("Content-Type")).toContain("text/event-stream");
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  async function next(): Promise<Event> {
-    for (;;) {
-      const end = buffer.indexOf("\n\n");
-      if (end >= 0) {
-        const frame = buffer.slice(0, end);
-        buffer = buffer.slice(end + 2);
-        const data = frame
-          .split("\n")
-          .find((line) => line.startsWith("data: "));
-        if (!data) continue;
-        const event: Event = JSON.parse(data.slice(6));
-        expect(frame.split("\n")).toContain(`id: ${event.seq}`);
-        return event;
-      }
-      const chunk = await reader.read();
-      if (chunk.done) throw new Error("SSE ended before the next event");
-      buffer += decoder.decode(chunk.value, { stream: true });
-    }
-  }
-  return {
-    next,
-    close: () => {
-      controller.abort();
-    },
-  };
 }
 
 describe("SSE and commit notifications", () => {

@@ -12,11 +12,13 @@ import {
   tokenInputSchema,
 } from "./domain/index.js";
 import { createApp } from "./http/index.js";
+import { startProxy } from "./mcp/proxy.js";
 import { createBoard } from "./service/index.js";
 
 const usage = `forge-board <command> --data <dir>
   init --name <human name>
   serve [--host <host>] [--port <port>] (port may be set in config.json)
+  mcp --url <server> --token <token> (or FORGE_BOARD_URL/FORGE_BOARD_TOKEN; no --data)
   principal create --kind human|agent --name <name> [--owner <human id>]
   principal list --limit <n> [--cursor <cursor>]
   principal disable <id>
@@ -30,7 +32,7 @@ const usage = `forge-board <command> --data <dir>
   approvals approve|reject <id> --expected-version <task version> [--lease-token <token>]
 Administration commands require --token <Bearer token> and accept --idempotency-key <key>.`;
 
-function main() {
+async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
     options: {
@@ -41,6 +43,7 @@ function main() {
       kind: { type: "string" },
       owner: { type: "string" },
       token: { type: "string" },
+      url: { type: "string" },
       principal: { type: "string" },
       scopes: { type: "string" },
       projects: { type: "string" },
@@ -68,6 +71,19 @@ function main() {
   };
   const output = (value: unknown) =>
     console.log(JSON.stringify(value, null, 2));
+  if (positionals[0] === "mcp") {
+    await startProxy(
+      required(
+        values.url ?? process.env.FORGE_BOARD_URL,
+        "--url or FORGE_BOARD_URL",
+      ),
+      required(
+        values.token ?? process.env.FORGE_BOARD_TOKEN,
+        "--token or FORGE_BOARD_TOKEN",
+      ),
+    );
+    return;
+  }
   const board = createBoard({ dataDir: required(values.data, "--data") });
   let serving = false;
   try {
@@ -215,7 +231,7 @@ function main() {
 }
 
 try {
-  main();
+  await main();
 } catch (error) {
   console.error(
     error instanceof BoardError

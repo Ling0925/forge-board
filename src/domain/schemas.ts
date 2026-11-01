@@ -236,7 +236,10 @@ export const pageSchema = z.strictObject({
 });
 export type PageInput = z.infer<typeof pageSchema>;
 export type Page<T> = { items: T[]; nextCursor: string | null };
-export const createTaskSchema = taskSchema
+export const linkInputSchema = linkSchema
+  .pick({ kind: true, ref: true })
+  .extend({ title: linkSchema.shape.title.unwrap().optional() });
+const taskInputSchema = taskSchema
   .pick({
     projectId: true,
     title: true,
@@ -254,7 +257,17 @@ export const createTaskSchema = taskSchema
         labels: true,
       })
       .partial().shape,
-  );
+  )
+  .extend({ links: z.array(linkInputSchema).optional() });
+export const createTaskSchema = taskInputSchema.extend({
+  subtasks: z
+    .array(
+      taskInputSchema
+        .omit({ projectId: true, parentId: true })
+        .extend({ accountable: taskInputSchema.shape.accountable.optional() }),
+    )
+    .optional(),
+});
 export type CreateTask = z.infer<typeof createTaskSchema>;
 export const updateTaskSchema = taskSchema
   .pick({
@@ -301,9 +314,6 @@ export const transitionSchema = z.strictObject({
   to: statusSchema,
   message: taskSchema.shape.statusMessage.optional(),
 });
-export const linkInputSchema = linkSchema
-  .pick({ kind: true, ref: true })
-  .extend({ title: linkSchema.shape.title.unwrap().optional() });
 export const commentInputSchema = commentSchema
   .pick({ kind: true, body: true })
   .extend({ replyTo: commentSchema.shape.replyTo.unwrap().optional() });

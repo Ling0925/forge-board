@@ -2,9 +2,13 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { beforeAll, describe, expect, it } from "vitest";
+import { name, version } from "../package.json";
 import { createBoard } from "../src/service/index.js";
 import { temporaryDirectory } from "./helpers.js";
+import { call, connectMcp } from "./transport-helpers.js";
 
 const executable = resolve("dist/cli.js");
 beforeAll(() => {
@@ -64,6 +68,55 @@ async function serving(
 }
 
 describe("built CLI", () => {
+  it.each(["flags", "env"])(
+    "proxies stdio tools and calls through HTTP using %s without a data directory",
+    async (mode) => {
+      const directory = temporaryDirectory();
+      const init = json(directory, ["init", "--name", "Proxy owner"]);
+      const project = json(
+        directory,
+        ["project", "create", "--key", "PROXY", "--name", "Proxy"],
+        init.secret,
+      );
+      await serving(directory, ["--port", "0"], async (url) => {
+        const http = await connectMcp(url, init.secret);
+        const client = new Client({ name, version });
+        const transport = new StdioClientTransport({
+          command: process.execPath,
+          args: [
+            executable,
+            "mcp",
+            ...(mode === "flags" ? ["--url", url, "--token", init.secret] : []),
+          ],
+          ...(mode === "env"
+            ? { env: { FORGE_BOARD_URL: url, FORGE_BOARD_TOKEN: init.secret } }
+            : {}),
+          stderr: "pipe",
+        });
+        try {
+          await client.connect(transport);
+          expect(await client.listTools()).toEqual(await http.listTools());
+          const task = await call(client, "board_create", {
+            projectId: project.id,
+            accountable: init.principal.id,
+            title: "Via proxy",
+            idempotencyKey: "proxy-create",
+          });
+          expect((await call(http, "board_get", { id: task.id })).task).toEqual(
+            task,
+          );
+          expect(
+            (await call(client, "board_list", { limit: 10, ready: true }))
+              .items,
+          ).toEqual([task]);
+        } finally {
+          await client.close();
+          await http.close();
+        }
+      });
+    },
+  );
+
   it("initializes once, persists only token hashes, and administers principals, tokens, and projects", () => {
     const directory = join(temporaryDirectory(), "new-board");
     const init = json(directory, ["init", "--name", "First human"]);

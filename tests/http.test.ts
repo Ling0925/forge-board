@@ -554,7 +554,7 @@ describe("HTTP API", () => {
     ).toEqual(disabled);
   });
 
-  it("serves OpenAPI 3.1 with every route, generated schemas, and resolvable references", async () => {
+  it("serves OpenAPI 3.1 with every REST route, generated schemas, and resolvable references", async () => {
     const { app } = httpFixture();
     const response = await app.request("/v1/openapi.json");
     const doc = await success(response);
@@ -567,7 +567,9 @@ describe("HTTP API", () => {
       )
       .sort();
     const routes = app.routes
-      .filter((route) => route.method !== "ALL")
+      .filter(
+        (route) => route.method !== "ALL" && route.path.startsWith("/v1/"),
+      )
       .map(
         (route) => `${route.method} ${route.path.replace(/:([^/]+)/g, "{$1}")}`,
       )

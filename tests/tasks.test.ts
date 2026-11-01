@@ -2,6 +2,73 @@ import { describe, expect, it } from "vitest";
 import { expectCode, fixture } from "./helpers.js";
 
 describe("task rules and graph", () => {
+  it("creates initial links and subtasks atomically with one idempotency key", () => {
+    const f = fixture();
+    const input = {
+      projectId: f.project.id,
+      accountable: f.owner.principal.id,
+      title: "Parent",
+      links: [{ kind: "thread" as const, ref: "forge:thread:parent" }],
+      subtasks: [
+        {
+          title: "Child",
+          links: [{ kind: "session" as const, ref: "forge:session:child" }],
+        },
+        { title: "Other child", accountable: f.other.principal.id },
+      ],
+    };
+    const mutation = { idempotencyKey: "tree" };
+    const parent = f.board.createTask(f.agent, input, mutation);
+    const children = f.board
+      .listTasks(f.agent, { parentId: parent.id, limit: 10 })
+      .items.sort((a, b) => a.title.localeCompare(b.title));
+    expect(children).toHaveLength(2);
+    expect(children[0]).toMatchObject({
+      projectId: f.project.id,
+      accountable: f.owner.principal.id,
+    });
+    expect(children[1]!.accountable).toBe(f.other.principal.id);
+    expect(
+      f.board.listLinks(f.agent, parent.id, { limit: 10 }).items[0],
+    ).toMatchObject(input.links[0]!);
+    expect(
+      f.board.listLinks(f.agent, children[0]!.id, { limit: 10 }).items[0],
+    ).toMatchObject(input.subtasks[0]!.links![0]!);
+    const events = f.repo.events(0);
+    expect(f.board.createTask(f.agent, input, mutation)).toEqual(parent);
+    expect(f.repo.events(0)).toEqual(events);
+    expectCode(
+      () =>
+        f.board.createTask(
+          f.agent,
+          { ...input, subtasks: [{ title: "Changed" }] },
+          mutation,
+        ),
+      "idempotency_mismatch",
+    );
+    expectCode(
+      () =>
+        f.board.createTask(f.agent, {
+          ...input,
+          subtasks: [
+            { title: "Valid" },
+            { title: "Invalid", accountable: f.agent.principal.id },
+          ],
+        }),
+      "forbidden",
+    );
+    expectCode(
+      () =>
+        f.board.createTask(f.agent, {
+          ...input,
+          links: [...input.links, ...input.links],
+        }),
+      "conflict",
+    );
+    expect(f.repo.events(0)).toEqual(events);
+    expect(f.board.listTasks(f.agent, { limit: 10 }).items).toHaveLength(3);
+  });
+
   it("creates sortable task IDs and per-project numbers with shared human/agent task fields", () => {
     const { board, admin, agent, owner, project, advance, task } = fixture();
     const first = task();
